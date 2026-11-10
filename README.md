@@ -297,7 +297,17 @@ You can also set up different Okta configuration profiles, which is useful if yo
 gimme-aws-creds --action-configure --profile profileName
 ```
 
-The wizard prompts you to enter the necessary configuration parameters; the only one that is required is `okta_org_url`. The configuration file is written to `~/.okta_aws_login_config` (override with the `OKTA_CONFIG` environment variable).
+The wizard prompts you to enter the necessary configuration parameters; the only one that is required is `okta_org_url`. The `OKTA_CONFIG` environment variable explicitly selects the configuration file.
+Without an override, an existing `~/.okta_aws_login_config` takes precedence.
+On Linux and macOS, other installations use `$XDG_CONFIG_HOME/gimme-aws-creds/config`,
+or `~/.config/gimme-aws-creds/config` when `XDG_CONFIG_HOME` is unset, empty or relative.
+Windows keeps the legacy home-file default. If both legacy and XDG files exist,
+the legacy file wins; use `OKTA_CONFIG` to select the XDG file explicitly.
+
+Configuration writes create missing parent directories (0700 on POSIX), without
+changing permissions on existing directories. Configuration reads create no directories.
+Existing files are never automatically moved or merged. AWS/Alibaba credential files,
+keyrings and registered authenticator files keep their existing locations.
 
 ### Configuration File Format
 
@@ -395,7 +405,7 @@ You can override values from the config section with environment variables. This
 | `GIMME_AWS_CREDS_ENABLE_ALICLOUD` | Corresponds to `enable_alicloud` and `--enable-alicloud`. |
 | `OKTA_API_KEY` | Required if `gimme_creds_server = internal`. |
 | `OKTA_AUTH_SERVER` | Corresponds to `okta_auth_server`. |
-| `OKTA_CONFIG` | Override location of the gimme-aws-creds config file (default `~/.okta_aws_login_config`). |
+| `OKTA_CONFIG` | Override location of the gimme-aws-creds config file; see Configuration for legacy/XDG precedence. |
 | `OKTA_DEVICE_TOKEN` | Corresponds to `device_token`; useful in CI. |
 | `OKTA_MFA_CODE` | Corresponds to `--mfa-code`. |
 | `OKTA_PASSWORD` | Provides password during authentication; useful in CI. |
