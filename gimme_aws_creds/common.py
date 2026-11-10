@@ -10,12 +10,23 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and* limitations under the License.*
 """
 import base64
+import binascii
 import platform
 import sys
 import xml.etree.ElementTree as ET
+import xml.parsers.expat
 from collections import namedtuple
 
 from bs4 import BeautifulSoup
+
+from . import errors
+
+# Upper bounds for IdP-supplied SAML assertions. Real assertions are usually a
+# few tens of KiB, even with large role lists and embedded signing
+# certificates. The encoded limit leaves room for line-wrapped base64.
+MAX_SAML_ASSERTION_B64_CHARS = 2 * 1024 * 1024
+MAX_SAML_ASSERTION_XML_BYTES = 1024 * 1024
+MAX_SAML_XML_DEPTH = 64
 
 RoleSet = namedtuple('RoleSet', 'idp, role, friendly_account_name, friendly_role_name')
 
@@ -55,9 +66,75 @@ def parse_saml_form(html_text):
     return fields.get('SAMLResponse'), fields.get('RelayState'), form_action
 
 
-def parse_saml_role_attributes(assertion_b64, attribute_name):
-    """Yield raw text values from the named SAML attribute in a base64 assertion."""
-    root = ET.fromstring(base64.b64decode(assertion_b64))
+class SamlAssertionError(errors.GimmeAWSCredsError):
+    """Raised when a SAML assertion cannot be safely decoded or parsed."""
+
+    def __init__(self, message):
+        super().__init__('Rejected SAML assertion: {}'.format(message))
+
+
+class _SamlXmlRejected(Exception):
+    """Internal signal raised from expat handlers to abort parsing."""
+
+
+def _decode_saml_assertion(assertion_b64):
+    """Base64-decode an assertion after enforcing encoded and decoded size limits."""
+    if not isinstance(assertion_b64, (str, bytes, bytearray)):
+        raise SamlAssertionError('expected base64 text')
+    if len(assertion_b64) > MAX_SAML_ASSERTION_B64_CHARS:
+        raise SamlAssertionError(
+            'encoded size exceeds {} characters'.format(MAX_SAML_ASSERTION_B64_CHARS))
+    try:
+        xml_bytes = base64.b64decode(assertion_b64)
+    except (binascii.Error, ValueError) as exc:
+        raise SamlAssertionError('invalid base64 encoding') from exc
+    if len(xml_bytes) > MAX_SAML_ASSERTION_XML_BYTES:
+        raise SamlAssertionError(
+            'decoded size exceeds {} bytes'.format(MAX_SAML_ASSERTION_XML_BYTES))
+    return xml_bytes
+
+
+def _check_saml_xml_structure(xml_bytes):
+    """Reject DTDs, entity declarations, and excessive nesting in one bounded pass.
+
+    SAML protocol messages do not use document type declarations. Refusing
+    them before any declaration is processed rules out internal entity
+    expansion and external entity or DTD retrieval in the later parse.
+    """
+    parser = xml.parsers.expat.ParserCreate()
+    depth = 0
+
+    def reject_declaration(*_args):
+        raise _SamlXmlRejected('document type and entity declarations are not allowed')
+
+    def start_element(_name, _attrs):
+        nonlocal depth
+        depth += 1
+        if depth > MAX_SAML_XML_DEPTH:
+            raise _SamlXmlRejected('element nesting exceeds {} levels'.format(MAX_SAML_XML_DEPTH))
+
+    def end_element(_name):
+        nonlocal depth
+        depth -= 1
+
+    parser.StartDoctypeDeclHandler = reject_declaration
+    parser.EntityDeclHandler = reject_declaration
+    parser.UnparsedEntityDeclHandler = reject_declaration
+    parser.ExternalEntityRefHandler = reject_declaration
+    parser.SetParamEntityParsing(xml.parsers.expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    parser.StartElementHandler = start_element
+    parser.EndElementHandler = end_element
+
+    try:
+        parser.Parse(xml_bytes, True)
+    except _SamlXmlRejected as exc:
+        raise SamlAssertionError(str(exc)) from None
+    except xml.parsers.expat.ExpatError as exc:
+        raise SamlAssertionError('malformed XML ({})'.format(
+            xml.parsers.expat.ErrorString(exc.code))) from None
+
+
+def _iter_saml_attribute_values(root, attribute_name):
     for attr in root.iter('{urn:oasis:names:tc:SAML:2.0:assertion}Attribute'):
         if attr.get('Name') != attribute_name:
             continue
@@ -65,6 +142,24 @@ def parse_saml_role_attributes(assertion_b64, attribute_name):
             text = (val.text or '').strip()
             if text:
                 yield text
+
+
+def parse_saml_role_attributes(assertion_b64, attribute_name):
+    """Return an iterator of raw text values from the named SAML attribute in a base64 assertion.
+
+    The assertion is decoded and parsed eagerly, so oversized, malformed, or
+    DTD-bearing input raises :class:`SamlAssertionError` before any value is
+    returned. Signature validation is left to the cloud STS that consumes the
+    assertion.
+    """
+    xml_bytes = _decode_saml_assertion(assertion_b64)
+    _check_saml_xml_structure(xml_bytes)
+    try:
+        # DTDs and entity declarations were refused above, so expansion cannot occur here.
+        root = ET.fromstring(xml_bytes)  # nosec B314
+    except ET.ParseError as exc:
+        raise SamlAssertionError('malformed XML ({})'.format(exc)) from None
+    return _iter_saml_attribute_values(root, attribute_name)
 
 
 def create_http_session(verify_ssl=True, allowed_methods=None, debug=False):
