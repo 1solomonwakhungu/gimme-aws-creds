@@ -42,9 +42,16 @@ When `gimme_creds_server` is set to a URL, the CLI:
 The handler itself does not validate the bearer token. It reads
 `event['requestContext']['authorizer']['principalId']` and uses that value as
 the Okta user ID or login. Authentication and trusted principal mapping therefore depend on an API
-Gateway authorizer that is not part of this repository. Establish an issuer,
-audience, and token-validation contract compatible with the selected login
-flow before deploying any replacement.
+Gateway authorizer that is not part of this repository.
+
+Identity Engine's organization-server access tokens are intended for Okta
+resources, not this custom API. Do not accept them in a replacement authorizer.
+Supporting that flow requires changing token acquisition to use an authorization
+server and audience intended for the custom API; authorizer configuration alone
+cannot make the current flow suitable. See
+[Okta's authorization-server guidance](https://developer.okta.com/docs/concepts/auth-servers/).
+For Classic, also verify that the configured server issues tokens for the custom
+API and that the requested scopes meet its authorization requirements.
 
 ## Known gaps
 
@@ -67,9 +74,10 @@ them. None of them describes a known deployment; the repository contains none.
 ### Authorizer and identity mapping
 
 - **No authorizer.** The sample delegates authentication entirely to an
-  external authorizer. A replacement must verify the token signature against
-  the authorization server's keys, and check issuer, audience, expiry, and
-  required scopes, before setting `principalId`.
+  external authorizer. For tokens issued specifically for the custom API
+  (excluding Okta organization-server access tokens), a replacement must verify
+  the signature against the authorization server's keys and check issuer,
+  audience, expiry, and required scopes before setting `principalId`.
 - **Principal mapping.** The authorizer must set `principalId` from the
   verified token's subject or login claim, never from request headers, query
   parameters, or the body. The handler places the value into
@@ -103,8 +111,9 @@ them. None of them describes a known deployment; the repository contains none.
   `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials:
   true`, a combination browsers reject for credentialed requests; the CLI does
   not need CORS headers.
-- **Local entry point.** `main()` builds a test event but no longer calls the
-  handler, so running the file directly does nothing.
+- **Local entry point.** `main()` reads `sys.argv[1]` and builds a test event
+  but does not call the handler. With no argument, direct execution raises
+  `IndexError`; supplying an argument still does not invoke the handler.
 
 ### Ownership
 
