@@ -43,9 +43,8 @@ class TestMaskConfigValue(unittest.TestCase):
 
     def test_password_is_REDACTED(self):
         result = _mask_config_value('okta_password', 'mypassword12345')
-        self.assertIn('[REDACTED]', result)
-        # Long values keep first 4 chars as a fingerprint
-        self.assertTrue(result.startswith('mypa'))
+        # The whole value is replaced; no prefix survives as a fingerprint
+        self.assertEqual(result, '[REDACTED]')
 
     def test_short_value_fully_REDACTED(self):
         result = _mask_config_value('password', 'short')
@@ -452,7 +451,7 @@ class TestDebugSamlRedaction(unittest.TestCase):
 
         out = DebugFormatter.format_response(PlainTextResponse())
 
-        self.assertIn("AWS STS SAML response redacted", out)
+        self.assertIn("[body omitted:", out)
         self.assertNotIn("RAW-SECRET", out)
         self.assertNotIn("AssumeRoleWithSAMLResponse", out)
 
@@ -462,6 +461,7 @@ class TestDebugSamlRedaction(unittest.TestCase):
         old_handlers = root_logger.handlers[:]
         old_level = root_logger.level
         old_gac_level = gac_logger.level
+        old_record_factory = logging.getLogRecordFactory()
         stream = io.StringIO()
 
         try:
@@ -488,6 +488,7 @@ class TestDebugSamlRedaction(unittest.TestCase):
                 root_logger.addHandler(handler)
             root_logger.setLevel(old_level)
             gac_logger.setLevel(old_gac_level)
+            logging.setLogRecordFactory(old_record_factory)
 
         out = stream.getvalue()
         self.assertIn("OperationModel(name=AssumeRoleWithSAML)", out)

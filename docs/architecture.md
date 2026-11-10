@@ -111,13 +111,13 @@ Handles Alibaba Cloud (AliCloud) RAM credential retrieval (OIE only):
 
 Provides structured, human-readable diagnostics activated by the `--debug` CLI flag:
 
-- `setup_debug_logging()` - Wires a clean stderr formatter into the `gimme_aws_creds` logger
+- `setup_debug_logging()` - Wires a clean stderr formatter into the root logger and installs a log-record factory that redacts every record (including third-party loggers and tracebacks) before any handler sees it
 - `create_debug_response_hook()` - Hook attached to the shared `requests.Session` (via `create_http_session(debug=True)`) that logs both request and response with colorization
-- `DebugFormatter` - Formats request/response with status-code coloring, sensitive header masking, and JSON pretty-printing
-- `_redact_sensitive_debug_text()` - Regex-based scrubbing of SAML payloads, OAuth `actor_token` / `subject_token` values, `?token=` query params, and embedded `AssumeRoleWithSAMLResponse` XML
+- `DebugFormatter` - Renders request/response deny-by-default: method, sanitized origin and path, status, elapsed time and request ID are shown; query, form and JSON values, headers and config values are shown only for allowlisted field names
+- `_redact_sensitive_debug_text()` - Best-effort free-text scrubbing for log messages that are not rendered structurally (query parameters, secret-named `key=value` / `key: value` pairs, authorization schemes, JWTs, sensitive XML elements and HTML inputs, percent-encoded variants)
 - `format_resolved_configuration()` - Emits a "Resolved Configuration" report showing the config file path, active profile, inheritance chain, CLI flags actually provided, environment variables consumed, effective `Config` attributes, and the merged profile dict, with the source of each value (`cli`, `env`, `profile`, `inherited from <parent>`, `default`)
 
-Sensitive fields redacted by default include: `access_token`, `id_token`, `sessionToken`, `stateToken`, `password`, `SAMLResponse`, `SAMLAssertion`, `passCode`, `client_secret`, `actor_token`, `subject_token`, and the `Authorization` / `Cookie` / `Set-Cookie` headers.
+Values are redacted unless their field name is on `_SAFE_VALUE_FIELDS`, `_SAFE_HEADERS` or `_SAFE_CONFIG_KEYS`. Redaction replaces the whole value; no prefix is kept. Bodies that are neither JSON nor form data are summarized by size and media type instead of printed.
 
 ### 9. UI Abstraction (ui.py)
 
@@ -207,7 +207,7 @@ Custom exception hierarchy in `errors.py`:
 3. **FIDO Authenticators**: Credential IDs hashed with SHA-512 for storage in `registered_authenticators.py`
 4. **SSL Verification**: Configurable but enabled by default (override with `--insecure` / `-k` - not recommended for production)
 5. **Session Tokens**: Short-lived, not persisted to disk
-6. **Debug Output Redaction**: `debug_formatter.py` redacts SAML payloads, OAuth tokens, passwords, authorization headers, cookies, and embedded `AssumeRoleWithSAMLResponse` XML before they reach stderr
+6. **Debug Output Redaction**: `debug_formatter.py` renders `--debug` output deny-by-default, showing values only for allowlisted fields, and redacts every log record before it reaches stderr
 7. **Credential Expiration**: `x_security_token_expires` (RFC3339) is written alongside credentials so external tools can refresh proactively
 
 ## Extension Points
@@ -218,4 +218,4 @@ Custom exception hierarchy in `errors.py`:
 4. **Shared HTTP Clients**: New Okta client classes can inherit `OktaHttpMixin` from `common.py` for consistent OAuth-aware HTTP methods
 5. **SAML Parsing**: Use `parse_saml_form()` and `parse_saml_role_attributes()` from `common.py` for new SAML integrations
 6. **Cloud Providers**: New provider modules can follow the `alibaba_cloud.py` pattern and reuse `okta_token_exchange()` for Okta-backed flows
-7. **Debug Diagnostics**: Add new redaction rules in `debug_formatter._redact_sensitive_debug_text()` or extend `_CONFIG_OBJECT_ATTRS` to surface new config attributes in the resolved-configuration report
+7. **Debug Diagnostics**: To show a new non-secret field's value, add it to `_SAFE_VALUE_FIELDS` (HTTP bodies and queries), `_SAFE_HEADERS` or `_SAFE_CONFIG_KEYS`; extend `_CONFIG_OBJECT_ATTRS` to surface new config attributes in the resolved-configuration report
