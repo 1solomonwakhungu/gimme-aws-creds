@@ -14,6 +14,7 @@ import math
 import reprlib
 import time
 import webbrowser
+from urllib.parse import parse_qs
 import jwt
 import requests
 
@@ -29,6 +30,31 @@ class DeviceAuthorizationSlowDown(requests.exceptions.HTTPError):
     This subclasses HTTPError because a ``slow_down`` response used to surface
     as an HTTPError, so existing handlers keep catching it.
     """
+
+
+class _DeviceTokenAdapter(requests.adapters.BaseAdapter):
+    """Let the polling loop own retries without changing other token grants."""
+
+    def __init__(self, default_adapter):
+        self._default_adapter = default_adapter
+        self._polling_adapter = requests.adapters.HTTPAdapter(max_retries=0)
+
+    def send(self, request, **kwargs):
+        adapter = self._default_adapter
+        content_type = request.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+        if request.method == 'POST' and content_type == 'application/x-www-form-urlencoded':
+            try:
+                body = request.body.decode('ascii') if isinstance(request.body, bytes) else request.body
+                fields = parse_qs(body) if isinstance(body, str) else {}
+            except (UnicodeError, ValueError):
+                fields = {}
+            if fields.get('grant_type') == ['urn:ietf:params:oauth:grant-type:device_code']:
+                adapter = self._polling_adapter
+        return adapter.send(request, **kwargs)
+
+    def close(self):
+        # The session still owns the default adapter under its original prefix.
+        self._polling_adapter.close()
 
 
 def _positive_seconds(value):
@@ -103,6 +129,9 @@ class OktaIdentityEngine(OktaHttpMixin):
         self._http_client = create_http_session(
             verify_ssl=verify_ssl_certs, debug=debug)
         self._http_client.cookies = requests.cookies.RequestsCookieJar()
+        token_url = self._okta_org_url + '/oauth2/v1/token'
+        self._http_client.mount(
+            token_url, _DeviceTokenAdapter(self._http_client.get_adapter(token_url)))
     
     def use_oauth_access_token(self, val=True):
         self._use_oauth_access_token = val
@@ -273,7 +302,8 @@ class OktaIdentityEngine(OktaHttpMixin):
             headers=self._get_headers(),
             data={'client_id':self._client_id, 'device_code': device_code, 'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'},
             verify=self._verify_ssl_certs,
-            timeout=self.HTTP_TIMEOUT if timeout is None else timeout
+            timeout=self.HTTP_TIMEOUT if timeout is None else timeout,
+            allow_redirects=False,
         )
 
         # Safe JSON parsing with error handling

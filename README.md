@@ -262,7 +262,7 @@ To use gimme-aws-creds with an OIE domain, you must create a new OIDC Native App
 While you sign in, gimme-aws-creds polls Okta for the result as described in [RFC 8628 section 3.5](https://www.rfc-editor.org/rfc/rfc8628#section-3.5):
 
 - It waits the `interval` Okta returns between token requests, or 5 seconds if Okta returns none or an invalid value.
-- Each `slow_down` response adds 5 seconds to the wait, and each request timeout doubles it.
+- Each `slow_down` response adds 5 seconds to the wait, and each request timeout doubles it. Device-token requests do not retry or follow redirects inside an individual poll.
 - It stops right away if sign-in is denied, the device code expires or Okta rejects the client.
 - It gives up 120 seconds after receiving the code, or sooner if the code's `expires_in` lifetime is shorter. Time spent waiting for Okta's responses counts toward that limit, and no new request starts after it.
 
