@@ -634,11 +634,22 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
                    'OKTA_USERNAME': 'user@example.test'}
         ui = MockUserInterface(environ=environ,
                                argv=['gimme-aws-creds', '--profile', 'p', '--debug', '--mfa-code', MFA_CLI])
-        with open(os.path.join(ui.HOME, '.okta_aws_login_config'), 'w') as f:
-            f.write(f'[p]\nokta_org_url = {ORG}\nclient_id = {CLIENT_ID}\n'
-                    f'okta_mfa_code = {MFA_CONF}\ndevice_flow_scope = openid {ECHO}\n')
+        config_path = os.path.join(ui.HOME, '.okta_aws_login_config')
+        Path(config_path).touch()
+        fixture = (f'[p]\nokta_org_url = {ORG}\nclient_id = {CLIENT_ID}\n'
+                   f'okta_mfa_code = {MFA_CONF}\ndevice_flow_scope = openid {ECHO}\n')
+        real_open = open
+
+        def fixture_open(path, *args, **kwargs):
+            # The real config parser reads the synthetic secret from memory.
+            # No credential-bearing fixture is written to the filesystem.
+            if os.fspath(path) == config_path:
+                return io.StringIO(fixture)
+            return real_open(path, *args, **kwargs)
+
         with debug_capture() as output:
-            with patch.object(GimmeAWSCreds, 'get_resolver', return_value=None):
+            with patch('builtins.open', side_effect=fixture_open), \
+                    patch.object(GimmeAWSCreds, 'get_resolver', return_value=None):
                 GimmeAWSCreds(ui=ui).generate_config()
         text = output()
         self.assertNoSecrets(text)
@@ -682,10 +693,17 @@ class TestDependencyRecords(LeakAssertions, unittest.TestCase):
         self.assertEqual(sum('"GET /activate/[id]' in r for r in output.records), 2)
 
     def test_registered_template_with_hostile_arguments(self):
+        from urllib3.connectionpool import HTTPSConnectionPool
+
+        pool = HTTPSConnectionPool('example.okta.test')
+        conn = Mock()
+        conn.is_closed = False
+        conn.getresponse.return_value = SimpleNamespace(
+            version_string='HTTP/1.1', status=200, length_remaining=0)
         with debug_capture() as output:
-            logging.getLogger('urllib3.connectionpool').debug(
-                '%s://%s:%s "%s %s %s" %s %s', 'https', 'example.okta.test', 443, 'GET',
-                f'https://u:{PASSWORD}@example.okta.test/api?opaque={ECHO}', 'HTTP/1.1', 200, None)
+            # Exercise the dependency's real log call with a mocked connection.
+            pool._make_request(conn, 'GET',
+                               f'https://u:{PASSWORD}@example.okta.test/api?opaque={ECHO}')
             logging.getLogger('urllib3.connectionpool').debug(
                 '%s://%s:%s "%s %s %s" %s %s', ECHO, f'{ECHO}.x', ECHO, ECHO, ECHO, ECHO, ECHO, ECHO)
         text = output()
