@@ -10,6 +10,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and* limitations under the License.*
 """
 import logging
+import math
+import reprlib
 import time
 import webbrowser
 import jwt
@@ -20,6 +22,44 @@ from .common import user_agent, parse_saml_form, create_http_session, OktaHttpMi
 
 logger = logging.getLogger(__name__)
 
+
+class DeviceAuthorizationSlowDown(requests.exceptions.HTTPError):
+    """The token endpoint answered ``slow_down`` (RFC 8628 section 3.5).
+
+    This subclasses HTTPError because a ``slow_down`` response used to surface
+    as an HTTPError, so existing handlers keep catching it.
+    """
+
+
+def _positive_seconds(value):
+    """Return ``value`` as a finite, positive number of seconds, or None.
+
+    Accepts numbers and numeric strings. Rejects booleans, other types, NaN,
+    infinities, zero and negative values.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(seconds) or seconds <= 0:
+        return None
+    return value
+
+
+def _format_seconds(seconds):
+    seconds = float(seconds)
+    return str(int(seconds)) if seconds.is_integer() else str(seconds)
+
+
 class OktaIdentityEngine(OktaHttpMixin):
     """
        The Okta Client Class performs the necessary API
@@ -27,7 +67,9 @@ class OktaIdentityEngine(OktaHttpMixin):
     """
 
     HTTP_TIMEOUT = 30  # Timeout in seconds for HTTP requests
-    DEVICE_FLOW_TIMEOUT = 120  # Timeout in seconds for device authorization flow (60 iterations * 2 seconds)
+    DEVICE_FLOW_TIMEOUT = 120  # Overall limit in seconds for device authorization polling
+    DEVICE_FLOW_DEFAULT_INTERVAL = 5  # RFC 8628 section 3.2: polling interval when the server sends none
+    DEVICE_FLOW_SLOW_DOWN_INCREMENT = 5  # RFC 8628 section 3.5: seconds added to the interval per slow_down
 
     def __init__(self, gac_ui, okta_org_url, client_id, verify_ssl_certs=True, device_token=None, device_flow_timeout=None, debug=False, device_flow_scope='openid okta.apps.sso'):
         """
@@ -35,6 +77,7 @@ class OktaIdentityEngine(OktaHttpMixin):
         :param okta_org_url: Base URL string for Okta IDP.
         :param client_id: Client ID that will be used for user auth
         :param verify_ssl_certs: Enable/disable SSL verification
+        :param device_flow_timeout: Overall limit in seconds for device authorization polling (default: 120)
         :param device_flow_scope: OAuth scope for device authorization (default: Web SSO / AWS flow)
         :param debug: Enable debug logging for API requests/responses
         """
@@ -49,7 +92,13 @@ class OktaIdentityEngine(OktaHttpMixin):
         self._use_oauth_id_token = False
         self._oauth_access_token = None
         self._oauth_id_token = None
-        self._device_flow_timeout = device_flow_timeout if device_flow_timeout is not None else self.DEVICE_FLOW_TIMEOUT
+        if device_flow_timeout is None:
+            device_flow_timeout = self.DEVICE_FLOW_TIMEOUT
+        self._device_flow_timeout = _positive_seconds(device_flow_timeout)
+        if self._device_flow_timeout is None:
+            raise errors.GimmeAWSCredsError(
+                "device_flow_timeout must be a positive number of seconds, got {}".format(
+                    reprlib.repr(device_flow_timeout)), 2)
 
         self._http_client = create_http_session(
             verify_ssl=verify_ssl_certs, debug=debug)
@@ -64,7 +113,9 @@ class OktaIdentityEngine(OktaHttpMixin):
     def auth_session(self, **kwargs):
         """ Authenticate the user and return the Okta Identity and access token"""
         login_response = self._start_device_flow()
-        
+        # The polling deadline is measured from receipt of the device authorization response.
+        authorization_received_at = self._monotonic()
+
         # Safe access to nested response data
         if 'apiResponse' not in login_response or 'verification_uri_complete' not in login_response['apiResponse']:
             raise errors.GimmeAWSCredsError("Invalid response from device authorization flow", 2)
@@ -86,20 +137,10 @@ class OktaIdentityEngine(OktaHttpMixin):
         if 'device_code' not in login_response['apiResponse']:
             raise errors.GimmeAWSCredsError("Device code missing from authorization response", 2)
         
-        token_response = self._get_user_tokens(login_response['apiResponse']['device_code'])
-        
-        # Calculate max iterations based on timeout (default 120 seconds / 2 second intervals = 60 iterations)
-        max_iterations = self._device_flow_timeout // 2
-        count = 0
-        while token_response is None and count < max_iterations:
-            time.sleep(2)
-            token_response = self._get_user_tokens(login_response['apiResponse']['device_code'])
-            count += 1
-        
-        if count >= max_iterations and token_response is None:
-            raise errors.GimmeAWSCredsError(
-                "Timeout waiting for device authorization ({} seconds)".format(self._device_flow_timeout), 2)
-        
+        interval, expires_in = self._device_flow_timing(login_response['apiResponse'])
+        token_response = self._poll_for_user_tokens(
+            login_response['apiResponse']['device_code'], interval, expires_in, authorization_received_at)
+
         # Safe access to token response fields
         if 'access_token' not in token_response:
             raise errors.GimmeAWSCredsError("Access token missing from token response", 2)
@@ -139,13 +180,100 @@ class OktaIdentityEngine(OktaHttpMixin):
         else:
             response.raise_for_status()
     
-    def _get_user_tokens(self, device_code):
+    def _device_flow_timing(self, device_response):
+        """Read the polling interval and device code lifetime from a device authorization response.
+
+        Returns ``(interval, expires_in)``. A missing interval uses the RFC 8628 default of
+        five seconds; an invalid one uses the default and prints a warning. A missing or
+        invalid ``expires_in`` returns None, which leaves the configured timeout in charge.
+        """
+        raw_interval = device_response.get('interval')
+        interval = _positive_seconds(raw_interval)
+        if interval is None:
+            if raw_interval is not None:
+                self.ui.warning(
+                    "Ignoring invalid device authorization interval {} from Okta; "
+                    "waiting {} seconds between token requests".format(
+                        reprlib.repr(raw_interval), self.DEVICE_FLOW_DEFAULT_INTERVAL))
+            interval = self.DEVICE_FLOW_DEFAULT_INTERVAL
+
+        raw_expires_in = device_response.get('expires_in')
+        expires_in = _positive_seconds(raw_expires_in)
+        if expires_in is None and raw_expires_in is not None:
+            self.ui.warning(
+                "Ignoring invalid device code lifetime (expires_in) {} from Okta; "
+                "using the {} second device authorization timeout".format(
+                    reprlib.repr(raw_expires_in), _format_seconds(self._device_flow_timeout)))
+        return interval, expires_in
+
+    def _poll_for_user_tokens(self, device_code, interval, expires_in, started_at):
+        """Poll the token endpoint until device authorization finishes (RFC 8628 section 3.5).
+
+        The first token request is sent immediately. Each later request waits at least
+        ``interval`` seconds after the previous response. A ``slow_down`` response adds
+        five seconds to the interval and a request timeout doubles it; both changes last
+        for the rest of the flow. Terminal OAuth errors such as ``access_denied``,
+        ``expired_token`` and ``invalid_client`` end polling immediately.
+
+        Polling stops at the earlier of the configured timeout and the server's
+        ``expires_in``, both counted on a monotonic clock from ``started_at``. Time spent
+        waiting for HTTP responses counts toward that limit. No request starts at or
+        after the deadline, and each request's timeout is capped at the time remaining.
+        requests applies that timeout to connecting and to each socket read, not to the
+        whole response or DNS resolution. An in-flight request can exceed the deadline;
+        a token it returns is still used.
+        """
+        limited_by_expiry = expires_in is not None and expires_in < self._device_flow_timeout
+        budget = expires_in if limited_by_expiry else self._device_flow_timeout
+        deadline = started_at + budget
+        next_poll_at = started_at
+
+        while True:
+            now = self._monotonic()
+            if next_poll_at > now:
+                if next_poll_at >= deadline:
+                    break
+                self._sleep(next_poll_at - now)
+                now = self._monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                break
+
+            try:
+                token_response = self._get_user_tokens(device_code, timeout=min(self.HTTP_TIMEOUT, remaining))
+            except DeviceAuthorizationSlowDown:
+                interval += self.DEVICE_FLOW_SLOW_DOWN_INCREMENT
+                logger.debug("Token endpoint returned slow_down; polling interval is now %s seconds", interval)
+            except requests.exceptions.Timeout:
+                interval *= 2
+                logger.debug("Token request timed out; polling interval is now %s seconds", interval)
+            else:
+                if token_response is not None:
+                    return token_response
+            next_poll_at = self._monotonic() + interval
+
+        if limited_by_expiry:
+            raise errors.GimmeAWSCredsError(
+                "The device code expired after {} seconds before authorization was completed. "
+                "Run the command again to get a new code".format(_format_seconds(budget)), 2)
+        raise errors.GimmeAWSCredsError(
+            "Timeout waiting for device authorization ({} seconds)".format(_format_seconds(budget)), 2)
+
+    def _get_user_tokens(self, device_code, timeout=None):
+        """Send one device flow token request.
+
+        Returns the token response on success and None while authorization is pending.
+        Raises DeviceAuthorizationSlowDown (an HTTPError) when the server asks the client
+        to poll less often, GimmeAWSCredsError for other OAuth errors such as
+        ``access_denied``, ``expired_token`` or ``invalid_client``, and HTTPError for
+        other HTTP failures. ``timeout`` defaults to HTTP_TIMEOUT.
+        """
         response = self._http_client.post(
             self._okta_org_url + '/oauth2/v1/token',
             headers=self._get_headers(),
             data={'client_id':self._client_id, 'device_code': device_code, 'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'},
             verify=self._verify_ssl_certs,
-            timeout=self.HTTP_TIMEOUT
+            timeout=self.HTTP_TIMEOUT if timeout is None else timeout
         )
 
         # Safe JSON parsing with error handling
@@ -159,12 +287,42 @@ class OktaIdentityEngine(OktaHttpMixin):
             self._oauth_access_token = response_data.get('access_token')
             self._oauth_id_token = response_data.get('id_token')
             return response_data
-        elif response.status_code == 400 and response_data.get('error') == 'authorization_pending':
+
+        error = response_data.get('error') if isinstance(response_data, dict) else None
+        if response.status_code == 400 and error == 'authorization_pending':
             return None
+        if response.status_code == 400 and error == 'slow_down':
+            raise DeviceAuthorizationSlowDown(
+                "Token endpoint asked the client to slow down", response=response)
+        if isinstance(error, str) and error:
+            raise errors.GimmeAWSCredsError(self._device_flow_error_message(error, response_data), 2)
+        response.raise_for_status()
+        raise errors.GimmeAWSCredsError(
+            "Unexpected HTTP {} response from token endpoint".format(response.status_code), 2)
+
+    def _device_flow_error_message(self, error, response_data):
+        if error == 'access_denied':
+            message = "Device authorization was denied"
+        elif error == 'expired_token':
+            message = ("The device code expired before authorization was completed. "
+                       "Run the command again to get a new code")
+        elif error in ('invalid_client', 'unauthorized_client'):
+            message = "The token endpoint rejected client_id ({}): {}".format(self._client_id, error)
         else:
-            response.raise_for_status()
-            return None
-    
+            message = "Device authorization failed: {}".format(error)
+        description = response_data.get('error_description')
+        if isinstance(description, str) and description:
+            message += " ({})".format(description)
+        return message
+
+    @staticmethod
+    def _monotonic():
+        return time.monotonic()
+
+    @staticmethod
+    def _sleep(seconds):
+        time.sleep(seconds)
+
     def _web_sso_token_exchange(self, app_id, access_token, id_token):
         return okta_token_exchange(
             self._http_client, self._okta_org_url, self._client_id,
