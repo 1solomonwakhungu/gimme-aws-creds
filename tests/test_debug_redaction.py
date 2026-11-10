@@ -564,9 +564,17 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
         }
         with debug_capture() as output:
             client = OktaIdentityEngine(self.ui, ORG, CLIENT_ID, debug=True)
-            self._mount(client._http_client, routes)
-            started = client._start_device_flow()
-            tokens = client._get_user_tokens(started['apiResponse']['device_code'])
+            self.addCleanup(client._http_client.close)
+            adapter = self._mount(client._http_client, routes)
+            token_adapter = client._http_client.get_adapter(ORG + '/oauth2/v1/token')
+            # Keep device-grant routing and response hooks; replace only transport.
+            with patch.object(token_adapter._polling_adapter, 'send',
+                              side_effect=adapter.send) as poll:
+                started = client._start_device_flow()
+                tokens = client._get_user_tokens(started['apiResponse']['device_code'])
+            poll.assert_called_once()
+        self.assertEqual([request.url for request in adapter.requests],
+                         [ORG + '/oauth2/v1/device/authorize', ORG + '/oauth2/v1/token'])
         self.assertEqual(tokens['id_token'], ID_TOKEN)
         text = output()
         self.assertNoSecrets(text)

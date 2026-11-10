@@ -259,6 +259,15 @@ To use gimme-aws-creds with an OIE domain, you must create a new OIDC Native App
 
 > Make sure to use the same authentication policy for both the AWS Federation Application and the OIDC application (or at least equivalent policy rules). If not, you'll receive an error when requesting the Web SSO token.
 
+While you sign in, gimme-aws-creds polls Okta for the result as described in [RFC 8628 section 3.5](https://www.rfc-editor.org/rfc/rfc8628#section-3.5):
+
+- It waits the `interval` Okta returns between token requests, or 5 seconds if Okta returns none or an invalid value.
+- Each `slow_down` response adds 5 seconds to the wait, and each request timeout doubles it. Device-token requests do not retry or follow redirects inside an individual poll.
+- It stops right away if sign-in is denied, the device code expires or Okta rejects the client.
+- It gives up 120 seconds after receiving the code, or sooner if the code's `expires_in` lifetime is shorter. Time spent waiting for Okta's responses counts toward that limit, and no new request starts after it.
+
+Each request's timeout is capped at the time left. The `requests` library applies that timeout to connecting and to each read rather than to the whole response, and DNS resolution has no separate deadline. A response already in progress can therefore finish after the limit.
+
 ### Forcing the use of the Okta Classic login flow
 
 The login flow used in Okta Classic currently still works with Okta Identity Engine domains, but with these caveats:

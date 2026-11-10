@@ -85,7 +85,7 @@ Handles authentication for Okta Identity Engine domains. Inherits from `OktaHttp
 **Authentication Flow:**
 1. POST to `/oauth2/v1/device/authorize`
 2. User authenticates via browser
-3. Poll `/oauth2/v1/token` for completion
+3. Poll `/oauth2/v1/token` for completion, following RFC 8628 timing: the server's `interval` (default 5 seconds), +5 seconds per `slow_down`, doubled interval after a request timeout, and a monotonic deadline at the earlier of `expires_in` and the 120-second client limit
 4. Exchange tokens for Web SSO token (`urn:okta:oauth:token-type:web_sso_token`)
 5. Retrieve SAML assertion
 
