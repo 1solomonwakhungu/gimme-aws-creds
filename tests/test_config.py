@@ -283,11 +283,9 @@ client_id = foo
 
     def test_okta_config_env_var_overrides_default_path(self):
         """Test that OKTA_CONFIG env var overrides default config file path"""
-        custom_config_path = '/tmp/custom_okta_config.ini'
-        test_ui = MockUserInterface(
-            environ={'OKTA_CONFIG': custom_config_path},
-            argv=[]
-        )
+        test_ui = MockUserInterface(argv=[])
+        custom_config_path = os.path.join(test_ui.HOME, 'custom_okta_config.ini')
+        test_ui.environ['OKTA_CONFIG'] = custom_config_path
         # Create config file at custom path
         with open(custom_config_path, "w") as config_file:
             config_file.write("""

@@ -134,3 +134,48 @@ class TestConfigPaths(unittest.TestCase):
         self.assertEqual(config.get_config_dict()['client_id'], 'new')
         config.conf_profile = 'first'
         self.assertEqual(config.get_config_dict()['client_id'], 'original')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX symlink traversal')
+    def test_existing_parent_after_symlink_dotdot_needs_no_creation(self):
+        leaf = self.home / 'real' / 'leaf'
+        leaf.mkdir(parents=True)
+        destination = self.home / 'real' / 'dest' / 'config'
+        self.create_file(destination)
+        link = self.home / 'link'
+        link.symlink_to(leaf, target_is_directory=True)
+        path = str(link) + '/../dest/config'
+        config = self.config({'OKTA_CONFIG': path})
+        with patch('gimme_aws_creds.config.os.mkdir') as mkdir:
+            config.write_config_file({'client_id': 'updated'})
+        mkdir.assert_not_called()
+        self.assertIn('updated', destination.read_text())
+        self.assertFalse((self.home / 'dest').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX symlink traversal')
+    def test_missing_parent_after_symlink_dotdot_uses_actual_destination(self):
+        leaf = self.home / 'real' / 'leaf'
+        leaf.mkdir(parents=True)
+        link = self.home / 'link'
+        link.symlink_to(leaf, target_is_directory=True)
+        for name in ('explicit', 'xdg'):
+            with self.subTest(location=name):
+                root = str(link) + '/../' + name
+                environ = ({'OKTA_CONFIG': root + '/config'} if name == 'explicit'
+                           else {'XDG_CONFIG_HOME': root})
+                config = self.config(environ)
+                config.write_config_file({'client_id': 'synthetic'})
+                destination = self.home / 'real' / name
+                if name == 'xdg':
+                    destination = destination / 'gimme-aws-creds'
+                self.assertTrue((destination / 'config').is_file())
+                self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o700)
+                self.assertFalse((self.home / name).exists())
+
+    def test_relative_parent_creation_terminates_at_current_directory(self):
+        previous = os.getcwd()
+        try:
+            os.chdir(self.home)
+            self.config({'OKTA_CONFIG': 'nested/config'}).write_config_file({'client_id': 'synthetic'})
+            self.assertTrue((self.home / 'nested' / 'config').is_file())
+        finally:
+            os.chdir(previous)
