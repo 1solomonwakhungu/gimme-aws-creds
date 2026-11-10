@@ -41,10 +41,7 @@ class Config:
         self._alicloud_sdk_available = alicloud_sdk_available
         self.ui = gac_ui
         self.FILE_ROOT = self.ui.HOME
-        self.OKTA_CONFIG = self.ui.environ.get(
-            'OKTA_CONFIG',
-            os.path.join(self.FILE_ROOT, '.okta_aws_login_config')
-        )
+        self.OKTA_CONFIG = self._resolve_config_path()
         # Tracking for `--debug` output: how each config value was determined.
         # See log_resolved_configuration().
         self._cli_args_provided = {}
@@ -98,6 +95,47 @@ class Config:
         if create_config and not os.path.isfile(self.OKTA_CONFIG):
             self.ui.notify('No gimme-aws-creds configuration file found, starting first-time configuration...')
             self.update_config_file()
+
+    def _resolve_config_path(self):
+        """Preserve explicit and legacy locations before choosing an XDG path."""
+        if 'OKTA_CONFIG' in self.ui.environ:
+            return self.ui.environ['OKTA_CONFIG']
+
+        legacy = os.path.join(self.FILE_ROOT, '.okta_aws_login_config')
+        # Keep an existing legacy path authoritative, including a broken symlink
+        # or directory, rather than silently selecting another login identity.
+        if os.name == 'nt' or os.path.lexists(legacy):
+            return legacy
+
+        config_home = self.ui.environ.get('XDG_CONFIG_HOME', '')
+        if not config_home or not os.path.isabs(config_home):
+            config_home = os.path.join(self.FILE_ROOT, '.config')
+        return os.path.join(config_home, 'gimme-aws-creds', 'config')
+
+    @staticmethod
+    def _create_config_parent(path):
+        """Create missing parents privately without changing existing modes."""
+        # Keep '..' intact: the filesystem resolves symlinks before it, just
+        # as open() will when writing the original configuration path.
+        parent = os.path.dirname(path) or os.curdir
+        missing = []
+        while True:
+            try:
+                os.stat(parent)
+            except FileNotFoundError:
+                ancestor = os.path.dirname(parent) or os.curdir
+                if ancestor == parent:
+                    raise
+                missing.append(parent)
+                parent = ancestor
+            else:
+                break
+        for directory in reversed(missing):
+            try:
+                os.mkdir(directory, mode=0o700)
+            except FileExistsError:
+                if not os.path.isdir(directory):
+                    raise
 
     def get_args(self):
         """Get the CLI args"""
@@ -440,10 +478,16 @@ class Config:
         config.read(self.OKTA_CONFIG)
         config[self.conf_profile] = config_dict
 
-        # write out the conf file
         buffer = io.StringIO()
         config.write(buffer)
-        self._write_private_config(self.OKTA_CONFIG, buffer.getvalue())
+        # Create directories only when configuration is explicitly written.
+        try:
+            self._create_config_parent(self.OKTA_CONFIG)
+            self._write_private_config(self.OKTA_CONFIG, buffer.getvalue())
+        except OSError as exc:
+            raise errors.GimmeAWSCredsError(
+                'Cannot write configuration file {}: {}'.format(self.OKTA_CONFIG, exc.strerror)
+            ) from exc
 
     # Owner read/write only: the config can hold an Okta device token.
     _CONFIG_FILE_MODE = 0o600

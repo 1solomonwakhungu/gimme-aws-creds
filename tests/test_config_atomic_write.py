@@ -126,8 +126,10 @@ class AtomicConfigWriteTest(unittest.TestCase):
             for target in ('gimme_aws_creds.config.os.fsync', 'gimme_aws_creds.config.os.replace'):
                 with self.subTest(failure=type(failure).__name__, at=target):
                     self.path.write_text(original)
+                    # OSError is reported as a configuration error; interrupts propagate.
+                    expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else GimmeAWSCredsError
                     with patch(target, side_effect=failure):
-                        with self.assertRaises(type(failure)):
+                        with self.assertRaises(expected):
                             self.write('partial')
                     self.assertEqual(self.path.read_text(), original)
                     self.assertEqual(self.leftovers(), [])
@@ -146,7 +148,7 @@ class AtomicConfigWriteTest(unittest.TestCase):
         planted = self.home / '.okta_config.0000000000000000.tmp'
         planted.symlink_to(victim)
         with patch('gimme_aws_creds.config.secrets.token_hex', return_value='0000000000000000'):
-            with self.assertRaises(FileExistsError):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'File exists'):
                 self.write()
         self.assertEqual(victim.read_text(), 'victim data')
         self.assertTrue(planted.is_symlink())
@@ -274,11 +276,13 @@ class AtomicConfigWriteTest(unittest.TestCase):
         self.assertIn('relative', (self.home / 'relative_config').read_text())
         self.assertEqual(self.leftovers(), [])
 
-    def test_missing_parent_raises_os_error(self):
-        # Parent creation is the caller's job; the writer reports plain OSError.
-        with self.assertRaises(FileNotFoundError):
-            self.write(path=self.home / 'missing' / 'config')
-        self.assertFalse((self.home / 'missing').exists())
+    @unittest.skipUnless(POSIX, 'POSIX permissions')
+    def test_missing_parent_is_created_before_private_write(self):
+        path = self.home / 'missing' / 'config'
+        self.write('nested', path=path)
+        self.assertEqual(file_mode(path.parent), 0o700)
+        self.assertEqual(file_mode(path), 0o600)
+        self.assertIn('nested', path.read_text())
 
     def test_windows_path_skips_posix_mode_and_ownership_calls(self):
         config = self.config()
