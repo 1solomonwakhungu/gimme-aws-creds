@@ -11,8 +11,9 @@ summaries), unknown fields and the contents of unknown containers are never
 printed, and every other value is replaced with ``[REDACTED]`` in full.
 
 Log records are rendered under the same policy. While debug logging is
-active a log-record factory replaces every record's message before any
-handler sees it:
+active a log-record factory renders ordinary logging calls before handlers
+see them. Reconstructed records and trusted in-process templates are not an
+untrusted-code isolation boundary:
 
 * text produced by this module's renderers is passed through;
 * records from ``gimme_aws_creds`` loggers keep their (code-constant) format
@@ -511,45 +512,11 @@ _define_header(_hidden,
                'Accept', 'Accept-Encoding', 'Accept-Language', 'Host', 'Server',
                'Cache-Control', 'Origin', 'Referer')
 
-# Request IDs are shown under an explicit policy: they must come from a
-# response header listed here, match the server's fixed format (Okta's
-# base64url request ID or an AWS UUID), and must not repeat any text the
-# client sent in the matching request. They are server-assigned correlation
-# IDs needed for support cases; anything else in these headers is hidden.
+# Correlation IDs can echo credentials, even when their format looks valid.
 _REQUEST_ID_HEADERS = ('x-okta-request-id', 'x-amzn-requestid',
                        'x-amz-request-id', 'x-request-id')
-_REQUEST_ID_RE = re.compile(
-    r'[A-Za-z0-9_-]{20,40}'
-    r'|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
-)
 for _name in _REQUEST_ID_HEADERS:
     _HEADERS[_normalize_name(_name)] = (_name, 'request_id')
-
-
-def _request_text(request):
-    """Every value the client sent in a request, used for the request-ID echo check."""
-    if request is None:
-        return ''
-    parts = [str(getattr(request, 'url', '') or '')]
-    body = getattr(request, 'body', None)
-    if isinstance(body, (bytes, bytearray)):
-        body = bytes(body).decode('utf-8', 'replace')
-    if isinstance(body, str):
-        parts.append(body)
-    headers = getattr(request, 'headers', None) or {}
-    try:
-        parts.extend(str(value) for value in headers.values())
-    except AttributeError:
-        pass
-    text = '\n'.join(parts)
-    return text + '\n' + unquote(text)
-
-
-def _safe_request_id(value, sent=''):
-    text = str(value or '')
-    if not _REQUEST_ID_RE.fullmatch(text) or (sent and text in sent):
-        return _INVALID
-    return text
 
 
 def _render_headers(headers, request=None):
@@ -560,7 +527,6 @@ def _render_headers(headers, request=None):
         items = list(headers.items())
     except AttributeError:
         return rendered, unknown
-    sent = None
     for key, value in items:
         entry = _HEADERS.get(_normalize_name(key))
         if entry is None:
@@ -572,10 +538,7 @@ def _render_headers(headers, request=None):
         if value in (None, ''):
             rendered.append((display, value))
         elif spec == 'request_id':
-            if sent is None:
-                sent = _request_text(request)
-            shown = _safe_request_id(value, sent)
-            rendered.append((display, REDACTED if shown is _INVALID else shown))
+            rendered.append((display, REDACTED))
         else:
             rendered.append((display, _check(spec, str(value))))
     return rendered, unknown
@@ -657,16 +620,6 @@ class DebugFormatter:
                 details.append(f"{float(elapsed.total_seconds()) * 1000:.0f} ms")
             except (TypeError, ValueError):
                 pass
-        sent = None
-        for name in _REQUEST_ID_HEADERS:
-            request_id = _header_value(headers, name)
-            if request_id:
-                if sent is None:
-                    sent = _request_text(request)
-                shown = _safe_request_id(request_id, sent)
-                if shown is not _INVALID:
-                    details.append(f"request id {shown}")
-                break
         detail_str = f" {cls.DIM}({', '.join(details)}){cls.RESET}" if details else ''
 
         lines.append(f"\n  {cls.MAGENTA}{cls.BOLD}◀ RESPONSE{cls.RESET}")
@@ -974,7 +927,7 @@ def _make_redacting_record_factory(base_factory):
 
 
 def install_redacting_record_factory():
-    """Make every new log record carry only policy-rendered text. Idempotent."""
+    """Render ordinary logging calls under the diagnostic policy. Idempotent."""
     current = logging.getLogRecordFactory()
     if getattr(current, 'gimme_aws_creds_redacting', False):
         return current
@@ -1169,7 +1122,7 @@ def format_resolved_configuration(config, conf_dict, env_overrides_applied=None,
     if 'OKTA_CONFIG' in env_used_in_init:
         path_source = 'env: OKTA_CONFIG'
     else:
-        path_source = 'default location (~/.okta_aws_login_config)'
+        path_source = 'configuration path discovery'
     lines.append(
         f"  {df.YELLOW}Configuration file:{df.RESET} {okta_config_path} "
         f"{df.DIM}[{path_source}]{df.RESET}"

@@ -190,7 +190,7 @@ class TestFormatResolvedConfiguration(unittest.TestCase):
             "[myprofile]\nclient_id = foo\n",
         )
         out = format_resolved_configuration(config, conf_dict)
-        self.assertIn('default location', out)
+        self.assertIn('configuration path discovery', out)
         self.assertNotIn('env: OKTA_CONFIG', out)
 
     def test_env_okta_config_path_label(self):

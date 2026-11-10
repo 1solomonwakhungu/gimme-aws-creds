@@ -3,7 +3,7 @@
 Every secret below is a unique synthetic marker. Tests capture what a user
 would see (stdout and stderr) and every log record emitted, then assert that
 no marker, and no 8-character piece of a marker, survives. They also assert
-that safe diagnostics (method, path, status, timing, request ID) remain.
+that safe diagnostics (method, path, status, timing) remain.
 
 All HTTP traffic is served by an in-process adapter or a mocked urllib3
 connection; nothing leaves the host.
@@ -383,7 +383,7 @@ class TestHeaderRedaction(LeakAssertions, unittest.TestCase):
         self.assertNotIn('x-custom-unknown', out)
         self.assertEqual(out['[omitted]'], '1 unrecognized header')
         self.assertEqual(out['Content-Type'], 'application/json')
-        self.assertEqual(out['X-Okta-Request-Id'], REQUEST_ID)
+        self.assertEqual(out['X-Okta-Request-Id'], '[REDACTED]')
 
     def test_short_and_long_values_both_fully_redacted(self):
         for value in ('Bearer x', 'Bearer ' + AUTH_BEARER * 4):
@@ -404,12 +404,12 @@ class TestHeaderRedaction(LeakAssertions, unittest.TestCase):
         )
 
     def test_request_id_policy(self):
-        """Request IDs: fixed server format only, and never an echo of sent text."""
+        """Request IDs are omitted regardless of format or request encoding."""
         self.assertEqual(DebugFormatter._mask_sensitive_headers({'X-Okta-Request-Id': ECHO}),
                          {'X-Okta-Request-Id': '[REDACTED]'})
         uuid = '0f8fad5b-d9cb-469f-a165-70867728950e'
-        self.assertEqual(DebugFormatter._mask_sensitive_headers({'x-amzn-RequestId': uuid}),
-                         {'x-amzn-RequestId': uuid})
+        self.assertEqual(DebugFormatter._mask_sensitive_headers({'x-amzn-RequestId': '[REDACTED]'}),
+                         {'x-amzn-RequestId': '[REDACTED]'})
         routes = {('POST', '/api/v1/authn'): (
             200, '{"status": "SUCCESS"}',
             {'Content-Type': 'application/json', 'X-Okta-Request-Id': ECHO_ID})}
@@ -418,6 +418,21 @@ class TestHeaderRedaction(LeakAssertions, unittest.TestCase):
         text = output()
         self.assertNoSecrets(text)
         self.assertIn('X-Okta-Request-Id: [REDACTED]', text)
+
+    def test_request_ids_never_expose_outbound_or_encoded_echoes(self):
+        import urllib.parse
+        for header in ('X-Okta-Request-Id', 'x-amzn-requestid', 'X-Amz-Request-Id', 'X-Request-Id'):
+            for body in (ECHO_ID, urllib.parse.quote(ECHO_ID),
+                         ''.join('%%%02X' % ord(c) for c in ECHO_ID),
+                         ''.join('\\u%04x' % ord(c) for c in ECHO_ID)):
+                with self.subTest(header=header, body=body):
+                    routes = {('POST', '/api/v1/authn'): (
+                        200, '{"status":"SUCCESS"}', {header: ECHO_ID})}
+                    with debug_capture() as output:
+                        _serve(routes, 'POST', ORG + '/api/v1/authn',
+                               data=body, headers={header: ECHO_ID})
+                    self.assertNoSecrets(output())
+                    self.assertNotIn(ECHO_ID[:8], output())
 
 
 class TestStructuredBodies(LeakAssertions, unittest.TestCase):
@@ -525,7 +540,7 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
             _serve(routes, 'POST', ORG + '/api/v1/authn', json={'password': PASSWORD})
         text = output()
         self.assertNoSecrets(text)
-        self.assertRegex(output.stderr.getvalue(), rf'200 OK \(\d+ ms, request id {REQUEST_ID}\)')
+        self.assertRegex(output.stderr.getvalue(), r'200 OK \(\d+ ms\)')
         for expected in ('POST https://example.okta.test/api/v1/authn',
                          '"status": "SUCCESS"',
                          '"expires_in": 300', '"password": "[REDACTED]"'):
@@ -557,7 +572,7 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
         self.assertNoSecrets(text)
         self.assertIn('POST https://example.okta.test/oauth2/v1/device/authorize', text)
         self.assertIn('POST https://example.okta.test/oauth2/v1/token', text)
-        self.assertIn(f'request id {REQUEST_ID}', text)
+        self.assertNotIn(REQUEST_ID, text)
         self.assertRegex(text, r'200 OK \(\d+ ms')
         self.assertIn('Set-Cookie: [REDACTED]', text)
 
