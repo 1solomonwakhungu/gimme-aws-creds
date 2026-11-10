@@ -772,9 +772,11 @@ class OktaClassicClient(OktaHttpMixin):
                 saml_response = self.get_saml_response(saml_request_url)
                 return saml_response
 
-            saml_error = 'Did not receive SAML Response after successful authentication [' + url + ']'
+            # The URL can carry a sessionToken or stateToken and the page text
+            # can repeat submitted values, so neither is included.
+            saml_error = 'Did not receive SAML Response after successful authentication'
             if saml_soup.find(class_='error-content') is not None:
-                saml_error += '\n' + saml_soup.find(class_='error-content').get_text()
+                saml_error += ' (Okta returned an error page; its text is not shown)'
 
             raise errors.GimmeAWSCredsError(saml_error, 2)
 
