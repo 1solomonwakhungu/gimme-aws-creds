@@ -408,7 +408,7 @@ class TestHeaderRedaction(LeakAssertions, unittest.TestCase):
         self.assertEqual(DebugFormatter._mask_sensitive_headers({'X-Okta-Request-Id': ECHO}),
                          {'X-Okta-Request-Id': '[REDACTED]'})
         uuid = '0f8fad5b-d9cb-469f-a165-70867728950e'
-        self.assertEqual(DebugFormatter._mask_sensitive_headers({'x-amzn-RequestId': '[REDACTED]'}),
+        self.assertEqual(DebugFormatter._mask_sensitive_headers({'x-amzn-RequestId': uuid}),
                          {'x-amzn-RequestId': '[REDACTED]'})
         routes = {('POST', '/api/v1/authn'): (
             200, '{"status": "SUCCESS"}',
