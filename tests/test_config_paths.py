@@ -21,7 +21,8 @@ class TestConfigPaths(unittest.TestCase):
         self.xdg = self.home / '.config' / 'gimme-aws-creds' / 'config'
 
     def config(self, environ=None):
-        ui = SimpleNamespace(HOME=str(self.home), environ=environ or {})
+        # The writer warns when it restricts a broad existing mode.
+        ui = SimpleNamespace(HOME=str(self.home), environ=environ or {}, warning=lambda message: None)
         return Config(ui, create_config=False)
 
     def create_file(self, path, contents='[DEFAULT]\nclient_id = synthetic\n'):
@@ -146,9 +147,14 @@ class TestConfigPaths(unittest.TestCase):
         link.symlink_to(leaf, target_is_directory=True)
         path = str(link) + '/../dest/config'
         config = self.config({'OKTA_CONFIG': path})
-        with patch('gimme_aws_creds.config.os.mkdir') as mkdir:
+        real_mkdir = os.mkdir
+        with patch('gimme_aws_creds.config.os.mkdir', side_effect=real_mkdir) as mkdir:
             config.write_config_file({'client_id': 'updated'})
-        mkdir.assert_not_called()
+        # Only the writer's private staging directory is created, relative to
+        # the pinned destination directory; no parent directory is made.
+        for call in mkdir.call_args_list:
+            self.assertTrue(call.args[0].endswith('.tmp'), call)
+            self.assertIsNotNone(call.kwargs.get('dir_fd'), call)
         self.assertIn('updated', destination.read_text())
         self.assertFalse((self.home / 'dest').exists())
 

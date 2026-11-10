@@ -11,12 +11,170 @@ See the License for the specific language governing permissions and* limitations
 """
 import argparse
 import configparser
+import contextlib
+import errno
+import io
 import os
+import secrets
+import stat
+import sys
+
 import requests
 from urllib.parse import urlparse
 
 from . import errors, ui, version
 from .common import user_agent
+
+# Whether the config writer can pin directories with descriptors. os.replace()
+# and os.rename() share renameat(), but only os.rename is listed in
+# supports_dir_fd, so test that rather than os.replace.
+def _directory_descriptors_supported():
+    # lstat delegates to stat on older Python versions and may be absent
+    # from supports_dir_fd even though its dir_fd argument is supported.
+    return (
+        {os.open, os.stat, os.readlink, os.rename, os.unlink, os.mkdir, os.rmdir}
+        <= os.supports_dir_fd and os.listdir in os.supports_fd)
+
+
+_DIR_FD_SUPPORTED = _directory_descriptors_supported()
+
+# How the config writer keeps access granted by access control lists (ACLs)
+# off its staging directory; see Config._write_private_config.
+if sys.platform == 'darwin':
+    _ACL_POLICY = 'darwin'
+elif sys.platform.startswith('linux'):
+    _ACL_POLICY = 'linux'
+else:
+    _ACL_POLICY = None
+
+
+class _DarwinACL:
+    """Extended ACLs of open files, through the acl(3) functions in libSystem."""
+    _TYPE_EXTENDED = 0x00000100
+    _FIRST_ENTRY = 0
+    _NEXT_ENTRY = -1
+    _EXTENDED_ALLOW = 1
+    _EXTENDED_DENY = 2
+    _ENTRY_INHERITED = 1 << 4
+    _ENTRY_ONLY_INHERIT = 1 << 8
+    # Directory rights that let a principal add, remove or rename entries
+    # (ACL_ADD_FILE, ACL_ADD_SUBDIRECTORY, ACL_DELETE_CHILD) or give itself
+    # those rights (ACL_WRITE_SECURITY, ACL_CHANGE_OWNER).
+    _CHANGE_ENTRIES = (1 << 2) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13)
+
+    def __init__(self):
+        import ctypes
+        self._ctypes = ctypes
+        lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+        pointer, integer = ctypes.c_void_p, ctypes.c_int
+        for name, restype, argtypes in (
+                ('acl_get_fd_np', pointer, [integer, integer]),
+                ('acl_set_fd_np', integer, [integer, pointer, integer]),
+                ('acl_init', pointer, [integer]),
+                ('acl_get_entry', integer, [pointer, integer, ctypes.POINTER(pointer)]),
+                ('acl_get_tag_type', integer, [pointer, ctypes.POINTER(integer)]),
+                ('acl_get_permset_mask_np', integer, [pointer, ctypes.POINTER(ctypes.c_uint64)]),
+                ('acl_get_flagset_np', integer, [pointer, ctypes.POINTER(pointer)]),
+                ('acl_get_flag_np', integer, [pointer, integer]),
+                ('acl_free', integer, [pointer])):
+            function = getattr(lib, name)
+            function.restype = restype
+            function.argtypes = argtypes
+        self._lib = lib
+
+    def _error(self):
+        code = self._ctypes.get_errno() or errno.EIO
+        return OSError(code, os.strerror(code))
+
+    def _each_entry(self, fd):
+        """Yield the ACL entries of ``fd``; none if it has no extended ACL."""
+        ctypes, lib = self._ctypes, self._lib
+        ctypes.set_errno(0)
+        acl = lib.acl_get_fd_np(fd, self._TYPE_EXTENDED)
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return  # the file has no extended ACL
+            raise self._error()
+        try:
+            entry = ctypes.c_void_p()
+            which = self._FIRST_ENTRY
+            while True:
+                ctypes.set_errno(0)
+                if lib.acl_get_entry(acl, which, ctypes.byref(entry)) != 0:
+                    # acl_get_entry() fails with EINVAL after the last entry.
+                    if ctypes.get_errno() == errno.EINVAL:
+                        return
+                    raise self._error()
+                which = self._NEXT_ENTRY
+                yield entry
+        finally:
+            lib.acl_free(acl)
+
+    def _has_flag(self, entry, flag):
+        ctypes, lib = self._ctypes, self._lib
+        flagset = ctypes.c_void_p()
+        if lib.acl_get_flagset_np(entry, ctypes.byref(flagset)) != 0:
+            raise self._error()
+        value = lib.acl_get_flag_np(flagset, flag)
+        if value < 0:
+            raise self._error()
+        return bool(value)
+
+    def entries(self, fd):
+        """Return one flag per ACL entry of ``fd``: whether it was inherited."""
+        with contextlib.closing(self._each_entry(fd)) as each:
+            return [self._has_flag(entry, self._ENTRY_INHERITED) for entry in each]
+
+    def may_change_entries(self, fd):
+        """Whether an ACL entry of directory ``fd`` lets anyone change its entries.
+
+        Allow entries that apply to the directory itself and grant a right in
+        _CHANGE_ENTRIES count, whoever they name; so does an entry of an
+        unknown kind. Deny entries and inherit-only entries do not.
+        """
+        ctypes, lib = self._ctypes, self._lib
+        with contextlib.closing(self._each_entry(fd)) as each:
+            for entry in each:
+                tag = ctypes.c_int()
+                if lib.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                    raise self._error()
+                if tag.value == self._EXTENDED_DENY:
+                    continue
+                if tag.value != self._EXTENDED_ALLOW:
+                    return True
+                if self._has_flag(entry, self._ENTRY_ONLY_INHERIT):
+                    continue
+                rights = ctypes.c_uint64()
+                if lib.acl_get_permset_mask_np(entry, ctypes.byref(rights)) != 0:
+                    raise self._error()
+                if rights.value & self._CHANGE_ENTRIES:
+                    return True
+        return False
+
+    def clear(self, fd):
+        """Replace the extended ACL of ``fd`` with an empty one."""
+        acl = self._lib.acl_init(0)
+        if not acl:
+            raise self._error()
+        try:
+            if self._lib.acl_set_fd_np(fd, acl, self._TYPE_EXTENDED) != 0:
+                raise self._error()
+        finally:
+            self._lib.acl_free(acl)
+
+
+_darwin_acl = None
+
+
+def _darwin_acl_api():
+    """Return the shared _DarwinACL, or None if libSystem does not provide it."""
+    global _darwin_acl
+    if _darwin_acl is None:
+        try:
+            _darwin_acl = _DarwinACL()
+        except (ImportError, OSError, AttributeError):
+            return None
+    return _darwin_acl
 
 
 class Config:
@@ -483,15 +641,587 @@ class Config:
         config.read(self.OKTA_CONFIG)
         config[self.conf_profile] = config_dict
 
+        buffer = io.StringIO()
+        config.write(buffer)
         # Create directories only when configuration is explicitly written.
         try:
             self._create_config_parent(self.OKTA_CONFIG)
-            with open(self.OKTA_CONFIG, 'w') as configfile:
-                config.write(configfile)
+            self._write_private_config(self.OKTA_CONFIG, buffer.getvalue())
         except OSError as exc:
             raise errors.GimmeAWSCredsError(
                 'Cannot write configuration file {}: {}'.format(self.OKTA_CONFIG, exc.strerror)
             ) from exc
+
+    # Owner read/write only: the config can hold an Okta device token.
+    _CONFIG_FILE_MODE = 0o600
+    # Symlinks followed from the configuration path before giving up (ELOOP).
+    _MAX_CONFIG_SYMLINKS = 40
+    # Destination characters kept in the temporary name; the rest of the name
+    # is fixed-length, so a valid destination name always fits.
+    _TEMP_NAME_PREFIX = 32
+
+    def _write_private_config(self, path, data):
+        """Atomically create or replace ``path`` with owner-only permissions.
+
+        The data is written to a file with a fixed name inside a new staging
+        directory, which is created next to the destination with mode 0700,
+        opened once, and checked to be an empty directory owned by the current
+        user with no group or other permissions. The file is created with
+        O_EXCL and O_NOFOLLOW and mode 0600, flushed to disk and renamed over
+        the destination relative to the staging directory's descriptor.
+        Readers see either the old or the new file, never a partial one. An
+        error raised before the rename leaves the original untouched and
+        removes the staged file and directory; a crash can leave them behind.
+
+        * Group/other permission bits on an existing file are removed (with a
+          warning); owner bits are kept, so a rewrite never widens the mode.
+          A file that is not owner-writable is refused, as open() would.
+        * The existing owner and group are kept. If either cannot be kept
+          (only root may give a file away, and only a member may assign a
+          group), the write is refused rather than changing ownership.
+        * If the path is a symlink, the regular file it points to is replaced,
+          provided every link followed is owned by the current user or root
+          and is in a directory that is trusted in the same way as the
+          destination directory (see below). That is checked through the
+          directory's pinned descriptor before the link is read, so no other
+          user can swap the link for another while it is read; links in any
+          other directory, such as a shared or sticky one, are refused
+          without being read. Dangling links, links owned by other users and
+          links to anything other than a regular file are refused. A symlink to a directory
+          earlier in the path, followed by '..', resolves as the kernel does;
+          the path is never normalized lexically.
+
+        Threat model (POSIX). Every directory involved is opened once and
+        later operations are relative to those descriptors, so renaming or
+        replacing a parent directory cannot redirect the write.
+
+        The directory that will hold the file (after following symlinks) must
+        be owned by the current user or root, have no group or other write
+        bit, and have no ACL entry that lets anyone add, remove or rename its
+        entries or change its ACL or owner. Otherwise the write is refused
+        before anything is created, and nothing in that directory, including
+        its ACL, is changed. A shared or world-writable directory (even with
+        the sticky bit) is therefore not a supported configuration location;
+        the default and XDG locations are private directories.
+
+        Within such a directory only this user and root can put an entry
+        under a name, so the staging directory this process creates cannot
+        be swapped for another directory, and the file renamed into place is
+        always the one this process wrote. Cleanup removes only the staging
+        directory and file this process created, checked by identity first.
+        A staging directory that is not a directory, not owned by the
+        current user, not private or not empty when checked (which only the
+        same user or root could cause) is refused and left alone.
+
+        ACLs. A new directory can inherit ACL entries from its parent that
+        grant other users access its 0700 mode does not show, so the staging
+        directory's ACL is dealt with before it is checked and used:
+
+        * macOS: the extended ACL is read and removed through the directory's
+          descriptor (acl_get_fd_np/acl_set_fd_np) and read again to confirm
+          it is gone. Permissions are checked on every operation, so users it
+          named lose access at once, even through descriptors they opened
+          earlier; entries they created or a move of the directory meanwhile
+          are refused by the checks that follow. A directory with entries that
+          were not inherited is not the one just made, so it is refused and
+          its ACL left alone. ACLs of the destination and its directories are
+          only read, never changed; inherit-only entries of the destination
+          directory, which do not apply to it, are what the staging directory
+          can inherit.
+        * Linux: POSIX.1e ACL entries for named users and groups are limited
+          by the ACL mask, which is the group mode bits: without the group
+          write bit nobody they name can change the destination directory,
+          and the staging directory's group bits are zero. NFSv4 ACLs
+          (system.nfs4_acl) are not limited that way and are refused on
+          either directory.
+        * Other POSIX systems: refused, as their ACLs cannot be checked.
+
+        The staged file's mode and ACL are checked before anything is written
+        to it, and the directory and file again before the rename.
+
+        Not covered: processes running as the same user or as root, which can
+        change anything this process can; network filesystems whose server
+        grants access the local modes and ACLs do not show; and filesystems
+        that do not enforce POSIX ownership and modes. Another user who can
+        write to a directory earlier in the path can still change what the path resolves to
+        before it is opened, so success means the new file was published
+        where the path pointed when it was resolved. The
+        write fails, after publishing, if the published file or a pinned
+        directory no longer matches. POSIX systems without the descriptor
+        functions this needs are refused rather than written insecurely.
+
+        Windows: directory descriptors are not available, so the path is
+        resolved by name and none of the guarantees above are claimed. The
+        staging directory and file inherit the ACL of the destination
+        directory (by default the user profile, which is private) and
+        ``os.chmod`` only toggles the read-only flag, so POSIX modes and
+        ownership are not enforced there.
+        """
+        posix = os.name != 'nt'
+        if posix and not _DIR_FD_SUPPORTED:
+            raise errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: this platform cannot open '
+                'directories safely'.format(path))
+        if posix:
+            self._require_acl_support(path)
+        pinned = posix
+        opened = []
+        try:
+            directory, name, existing = self._locate_config_target(path, posix, pinned, opened)
+            if posix:
+                self._require_trusted_directory(path, directory)
+            self._replace_config(path, directory, name, existing, data, posix, opened)
+        finally:
+            for _, fd in opened:
+                os.close(fd)
+
+    @staticmethod
+    def _at(directory, name):
+        """Return the path and dir_fd arguments for ``name`` in ``directory``."""
+        directory_path, fd = directory
+        if fd is None:
+            return os.path.join(directory_path, name), None
+        return name, fd
+
+    @staticmethod
+    def _open_directory(directory_path, entry, dir_fd, pinned, opened):
+        """Open a directory once, resolving it as open() would.
+
+        ``directory_path`` names the directory in messages and later checks;
+        ``entry`` is opened relative to ``dir_fd``.
+        """
+        if not pinned:
+            return directory_path, None
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+        fd = os.open(entry, flags, dir_fd=dir_fd)
+        opened.append((directory_path, fd))
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), directory_path)
+        return directory_path, fd
+
+    def _locate_config_target(self, path, posix, pinned, opened):
+        """Find the directory and name to replace, following trusted symlinks.
+
+        Returns ``(directory, name, existing)`` where ``existing`` is the
+        lstat result of the current file, or None if there is none yet.
+        """
+        directory_path, name = os.path.split(path)
+        if not name:
+            raise errors.GimmeAWSCredsError(
+                'Cannot write configuration file {}: not a file path'.format(path))
+        directory_path = directory_path or os.curdir
+        directory = self._open_directory(directory_path, directory_path, None, pinned, opened)
+
+        def refuse_link(reason):
+            return errors.GimmeAWSCredsError(
+                'Refusing to follow configuration symlink {}: {}'.format(path, reason))
+
+        followed = 0
+        while True:
+            entry, dir_fd = self._at(directory, name)
+            try:
+                link = os.lstat(entry, dir_fd=dir_fd)
+            except FileNotFoundError as exc:
+                if followed:
+                    raise refuse_link(exc.strerror) from exc
+                return directory, name, None
+            if not stat.S_ISLNK(link.st_mode):
+                if stat.S_ISREG(link.st_mode):
+                    return directory, name, link
+                if followed:
+                    raise refuse_link('target is not a regular file')
+                raise errors.GimmeAWSCredsError(
+                    'Refusing to replace configuration file {}: not a regular file'.format(path))
+            if followed >= self._MAX_CONFIG_SYMLINKS:
+                raise refuse_link(os.strerror(errno.ELOOP))
+            if posix:
+                if link.st_uid not in (os.geteuid(), 0):
+                    raise refuse_link('owned by another user')
+                # Only a directory whose entries no other user can change
+                # guarantees that the link read below is the one just
+                # checked: elsewhere it could be moved aside, replaced and
+                # restored with nothing in its metadata to show it.
+                problem = self._directory_trust_problem(directory[1])
+                if problem:
+                    raise refuse_link('the directory {} that contains it {}'.format(
+                        directory[0], problem))
+            target = os.readlink(entry, dir_fd=dir_fd)
+            followed += 1
+
+            target_directory, name = os.path.split(target)
+            if name in ('', os.curdir, os.pardir):
+                raise refuse_link('target is not a regular file')
+            if target_directory:
+                display = os.path.join(directory[0], target_directory)
+                try:
+                    directory = self._open_directory(
+                        display, target_directory, directory[1], pinned, opened)
+                except OSError as exc:
+                    raise refuse_link(exc.strerror) from exc
+
+    # Name of the file inside the private staging directory. It is fixed:
+    # nobody else can create entries there.
+    _STAGED_FILE_NAME = 'config'
+
+    def _replace_config(self, path, directory, name, existing, data, posix, opened):
+        """Write ``data`` in a private staging directory and rename it to ``name``."""
+        mode = self._CONFIG_FILE_MODE
+        if existing is not None and posix:
+            current = stat.S_IMODE(existing.st_mode)
+            mode = current & self._CONFIG_FILE_MODE
+            if not mode & stat.S_IWUSR and os.geteuid() != 0:
+                raise errors.GimmeAWSCredsError(
+                    'Refusing to replace configuration file {}: it is read-only'.format(path))
+            if current & ~self._CONFIG_FILE_MODE:
+                self.ui.warning(
+                    'Configuration file had permissions {:04o}; restricting them to {:04o}.'.format(
+                        current, mode))
+
+        stage_name = '.{}.{}.tmp'.format(name[:self._TEMP_NAME_PREFIX], secrets.token_hex(8))
+        stage = None
+        try:
+            stage = self._create_staging_directory(path, directory, stage_name, posix)
+            self._publish_staged(path, directory, name, stage, existing, mode, data, posix, opened)
+        finally:
+            if stage is not None:
+                self._remove_staging_directory(directory, stage_name, stage)
+
+    def _create_staging_directory(self, path, directory, stage_name, posix):
+        """Create the private staging directory and return it pinned.
+
+        Returns ``(display_path, fd)``; ``fd`` is None on Windows.
+        """
+        entry, dir_fd = self._at(directory, stage_name)
+        display = os.path.join(directory[0], stage_name)
+        try:
+            os.mkdir(entry, 0o700, dir_fd=dir_fd)
+        except FileExistsError:
+            raise  # the name belongs to someone else
+        except BaseException:
+            # mkdir() may have succeeded before an interrupt was delivered.
+            self._discard_new_staging_directory(entry, dir_fd, None)
+            raise
+        if not posix:
+            return display, None
+
+        def refuse():
+            return errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: its staging directory {} was '
+                'replaced by another process'.format(path, display))
+
+        flags = (os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | os.O_NOFOLLOW
+                 | getattr(os, 'O_CLOEXEC', 0))
+        fd = None
+        ours = False
+        try:
+            try:
+                fd = os.open(entry, flags, dir_fd=dir_fd)
+            except OSError as exc:
+                # A symlink or non-directory now has the name we created.
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+                    raise refuse() from exc
+                raise
+
+            def private_and_empty():
+                st = os.fstat(fd)
+                return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid()
+                        and not stat.S_IMODE(st.st_mode) & 0o077 and not os.listdir(fd))
+
+            # Only this user and root can add or rename entries in the
+            # destination directory (_require_trusted_directory), so the
+            # name mkdir() just created refers to that directory or, if an
+            # inherited ACL let someone move it out, to nothing; nobody else
+            # can put another directory there. These checks guard against the
+            # same user or root, which are outside the threat model: mkdir()
+            # made it 0700 (less any umask bits), so group/other bits,
+            # another owner or existing entries mean this is not that
+            # directory, and it is left alone.
+            if not private_and_empty():
+                raise refuse()
+            ours = True
+            if not self._drop_inherited_acl(path, display, fd):
+                # A new directory only has inherited ACL entries.
+                ours = False
+                raise refuse()
+            # Until the inherited ACL was removed, the principals it named
+            # could add entries here or move the directory out of the
+            # destination directory; they no longer can, and anything they
+            # did is caught now.
+            if not private_and_empty() or not self._is_same_file(entry, dir_fd, os.fstat(fd)):
+                raise refuse()
+            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+                # The umask removed owner bits this process needs.
+                os.fchmod(fd, 0o700)
+        except errors.GimmeAWSCredsError:
+            if ours:
+                # Our empty directory, checked by identity before removal.
+                self._discard_new_staging_directory(entry, dir_fd, fd)
+            elif fd is not None:
+                # Whatever is there now is not ours to remove.
+                os.close(fd)
+            raise
+        except BaseException:
+            # Failed or interrupted while checking the directory just made.
+            self._discard_new_staging_directory(entry, dir_fd, fd)
+            raise
+        return display, fd
+
+    def _require_trusted_directory(self, path, directory):
+        """Refuse a destination directory whose entries other users can change.
+
+        Only its owner, if that is this user or root, may add, remove or
+        rename its entries: no group or other write bit, and no ACL entry
+        that grants those rights or the right to change the ACL or owner.
+        Nothing is created or changed before this check passes.
+        """
+        directory_path, fd = directory
+        problem = self._directory_trust_problem(fd)
+        if problem:
+            raise errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: its directory {} {}'.format(
+                    path, directory_path, problem))
+
+    def _directory_trust_problem(self, fd):
+        """Say why users other than this one and root may change entries of ``fd``.
+
+        Returns None for a trusted directory. The directory is only read.
+        """
+        st = os.fstat(fd)
+        if st.st_uid not in (os.geteuid(), 0):
+            return 'is owned by another user'
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            return 'is writable by other users (remove that with chmod go-w)'
+        try:
+            if _ACL_POLICY == 'darwin':
+                shared = _darwin_acl_api().may_change_entries(fd)
+            else:
+                # POSIX.1e ACLs: the group bits, checked above, are the mask
+                # that limits every named user and group entry. NFSv4 ACLs
+                # are not limited by the mode.
+                shared = self._has_nfs4_acl(fd)
+        except OSError as exc:
+            return 'has an access control list that cannot be checked ({})'.format(exc.strerror)
+        if shared:
+            return 'has an access control list that may let other users add or remove entries'
+        return None
+
+    def _require_acl_support(self, path):
+        """Refuse platforms where ACLs on the staging directory cannot be ruled out."""
+        if _ACL_POLICY == 'darwin' and _darwin_acl_api() is not None:
+            return
+        if _ACL_POLICY == 'linux':
+            return
+        raise errors.GimmeAWSCredsError(
+            'Refusing to write configuration file {}: access control lists cannot be '
+            'checked on this platform'.format(path))
+
+    @staticmethod
+    def _has_nfs4_acl(fd):
+        """Whether ``fd`` has an NFSv4 ACL, which Linux file modes do not limit."""
+        try:
+            os.getxattr(fd, 'system.nfs4_acl')
+        except OSError as exc:
+            if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+                return False
+            raise
+        return True
+
+    def _acl_may_grant_access(self, fd):
+        """Whether an ACL may give others access to ``fd`` despite an owner-only mode."""
+        if _ACL_POLICY == 'darwin':
+            return bool(_darwin_acl_api().entries(fd))
+        # POSIX.1e ACLs: the group mode bits are the ACL mask, which limits
+        # every named user and group entry; callers require them to be zero.
+        return self._has_nfs4_acl(fd)
+
+    def _drop_inherited_acl(self, path, display, fd):
+        """Remove the ACL the new staging directory inherited from its parent.
+
+        Returns False, changing nothing, if the directory has ACL entries that
+        were not inherited; raises if the ACL cannot be removed.
+        """
+        def failed(reason):
+            return errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: cannot remove the access control '
+                'list its staging directory {} inherited ({})'.format(path, display, reason))
+
+        if _ACL_POLICY != 'darwin':
+            # Linux: POSIX.1e ACLs are bounded by the 0700 mode; refuse the
+            # NFSv4 ACLs that are not.
+            try:
+                if self._has_nfs4_acl(fd):
+                    raise failed('NFSv4 ACLs are not limited by file modes')
+            except OSError as exc:
+                raise failed(exc.strerror) from exc
+            return True
+        acl = _darwin_acl_api()
+        try:
+            inherited = acl.entries(fd)
+            if not all(inherited):
+                return False
+            if inherited:
+                acl.clear(fd)
+                if acl.entries(fd):
+                    raise failed('it is still present')
+        except OSError as exc:
+            raise failed(exc.strerror) from exc
+        return True
+
+    def _require_private(self, path, fd):
+        """Refuse to go on if others can reach ``fd`` through its mode or an ACL."""
+        if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077 or self._acl_may_grant_access(fd):
+            raise errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: its staging area became accessible '
+                'to other users'.format(path))
+
+    @staticmethod
+    def _discard_new_staging_directory(entry, dir_fd, fd):
+        """Best-effort removal of a staging directory that was never used."""
+        try:
+            current = os.lstat(entry, dir_fd=dir_fd)
+            if fd is not None:
+                pinned = os.fstat(fd)
+                ours = (current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino)
+            elif os.name != 'nt':
+                ours = stat.S_ISDIR(current.st_mode) and current.st_uid == os.geteuid()
+            else:
+                ours = stat.S_ISDIR(current.st_mode)
+            if ours:
+                os.rmdir(entry, dir_fd=dir_fd)
+        except OSError:
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _remove_staging_directory(self, directory, stage_name, stage):
+        """Remove the staging directory if its name still refers to it."""
+        _, stage_fd = stage
+        entry, dir_fd = self._at(directory, stage_name)
+        try:
+            if stage_fd is None or self._is_same_file(entry, dir_fd, os.fstat(stage_fd)):
+                os.rmdir(entry, dir_fd=dir_fd)
+        except OSError:
+            pass
+        finally:
+            if stage_fd is not None:
+                os.close(stage_fd)
+
+    def _publish_staged(self, path, directory, name, stage, existing, mode, data, posix, opened):
+        """Write the staged file and rename it over the destination."""
+        temp_entry, temp_dir_fd = self._at(stage, self._STAGED_FILE_NAME)
+        target_entry, target_dir_fd = self._at(directory, name)
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+        handle = os.fdopen(os.open(temp_entry, flags, self._CONFIG_FILE_MODE, dir_fd=temp_dir_fd), 'w')
+        written = os.fstat(handle.fileno())
+        committed = False
+        try:
+            if posix:
+                if existing is not None:
+                    self._preserve_ownership(handle.fileno(), existing, path)
+                # Apply the mode explicitly: open() is subject to umask.
+                os.fchmod(handle.fileno(), mode)
+                # Nothing is written until the file is known to be private.
+                self._require_private(path, handle.fileno())
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            if not posix:
+                # Windows does not allow renaming this file while it is open.
+                handle.close()
+            # Only the same user or root can reach inside the staging directory,
+            # whose inherited ACL was removed; this catches such a change made
+            # before the rename, not during it.
+            if posix:
+                self._require_private(path, temp_dir_fd)
+                self._require_private(path, handle.fileno())
+            if posix and not self._is_same_file(temp_entry, temp_dir_fd, written):
+                raise errors.GimmeAWSCredsError(
+                    'Refusing to replace configuration file {}: the temporary file was '
+                    'replaced by another process'.format(path))
+            os.replace(temp_entry, target_entry, src_dir_fd=temp_dir_fd, dst_dir_fd=target_dir_fd)
+            committed = True
+            if posix:
+                self._fsync_directory(directory)
+                self._verify_published(path, target_entry, target_dir_fd, written, opened)
+        except BaseException:
+            if not committed:
+                self._remove_if_same_file(temp_entry, temp_dir_fd, written)
+            raise
+        finally:
+            handle.close()
+
+    @staticmethod
+    def _is_same_file(entry, dir_fd, expected):
+        try:
+            current = os.lstat(entry, dir_fd=dir_fd)
+        except OSError:
+            return False
+        return (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)
+
+    def _remove_if_same_file(self, entry, dir_fd, expected):
+        """Remove the temporary file, but never an entry someone put in its place."""
+        if self._is_same_file(entry, dir_fd, expected):
+            try:
+                os.unlink(entry, dir_fd=dir_fd)
+            except OSError:
+                pass
+
+    def _verify_published(self, path, entry, dir_fd, written, opened):
+        """Fail if the rename did not publish our file where ``path`` points."""
+        if not self._is_same_file(entry, dir_fd, written):
+            raise errors.GimmeAWSCredsError(
+                'Configuration file {} was changed by another process while it was '
+                'being written; check its contents'.format(path))
+        for directory_path, fd in opened:
+            try:
+                now = os.stat(directory_path)
+            except OSError:
+                now = None
+            pinned = os.fstat(fd)
+            if now is None or (now.st_dev, now.st_ino) != (pinned.st_dev, pinned.st_ino):
+                raise errors.GimmeAWSCredsError(
+                    'Configuration directory {} was moved or replaced while {} was being '
+                    'written; the new configuration is in the original directory'.format(
+                        directory_path, path))
+
+    @staticmethod
+    def _preserve_ownership(fd, existing, target):
+        """Give the replacement file the owner and group of the original."""
+        created = os.fstat(fd)
+        if (created.st_uid, created.st_gid) == (existing.st_uid, existing.st_gid):
+            return
+        try:
+            os.fchown(fd, existing.st_uid, existing.st_gid)
+        except PermissionError as exc:
+            if created.st_uid != existing.st_uid:
+                reason = 'it is owned by another user'
+            else:
+                reason = 'its group (gid {}) cannot be kept'.format(existing.st_gid)
+            raise errors.GimmeAWSCredsError(
+                'Refusing to replace configuration file {}: {}'.format(target, reason)) from exc
+
+    @staticmethod
+    def _fsync_directory(directory):
+        """Persist the rename; not every filesystem supports this."""
+        directory_path, fd = directory
+        if fd is not None:
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+            return
+        try:
+            fd = os.open(directory_path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
     def _get_org_url_entry(self, default_entry):
         """ Get and validate okta_org_url """
