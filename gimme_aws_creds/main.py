@@ -78,6 +78,10 @@ class GimmeAWSCreds:
         'AWS_STS_REGION': 'aws_region'
     }
 
+    # Keys of each entry printed by --action-list-roles --output-format json.
+    # This is a documented output format: keep the names and order stable.
+    ROLE_LISTING_FIELDS = ('idp', 'role', 'friendly_account_name', 'friendly_role_name')
+
     def __init__(self, ui=ui.cli):
         """
         :type ui: ui.UserInterface
@@ -1300,8 +1304,33 @@ class GimmeAWSCreds:
                 raise errors.GimmeAWSCredsExitSuccess()
 
     def handle_action_list_roles(self):
-        if self.config.action_list_roles:
-            raise errors.GimmeAWSCredsExitSuccess(result='\n'.join(map(str, self.aws_roles)))
+        if not self.config.action_list_roles:
+            return
+        # Only an explicit --output-format json on this command switches the
+        # listing to JSON; the output_format setting and its environment
+        # variable select the credential output format and leave it unchanged.
+        if self.config.action_output_format == 'json':
+            result = self._roles_to_json(self.aws_roles)
+        else:
+            result = '\n'.join(map(str, self.aws_roles))
+        raise errors.GimmeAWSCredsExitSuccess(result=result)
+
+    @classmethod
+    def _roles_to_json(cls, roles):
+        """Serialize roles as one JSON array for --action-list-roles --output-format json.
+
+        Each entry holds exactly the ROLE_LISTING_FIELDS keys, in that order, with
+        string values (a missing value becomes ""). Entries keep the order in
+        which roles were discovered, and an empty role list yields "[]".
+        """
+        entries = []
+        for role in roles:
+            entry = {}
+            for field in cls.ROLE_LISTING_FIELDS:
+                value = getattr(role, field)
+                entry[field] = '' if value is None else str(value)
+            entries.append(entry)
+        return json.dumps(entries)
 
     def handle_setup_fido_authenticator(self):
         if self.config.action_setup_fido_authenticator:

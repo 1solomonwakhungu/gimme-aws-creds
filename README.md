@@ -475,6 +475,33 @@ Run `gimme-aws-creds --help` for all available options.
 
 `gimme-aws-creds --action-list-roles` prints all available roles to stdout without retrieving credentials.
 
+Add `--output-format json` (or `-o json`) to print the roles as one JSON array instead, so scripts can choose a profile or role from what is available:
+
+```bash
+gimme-aws-creds --action-list-roles -o json
+```
+
+```json
+[{"idp": "arn:aws:iam::123456789012:saml-provider/okta", "role": "arn:aws:iam::123456789012:role/Admin", "friendly_account_name": "Account: example (123456789012)", "friendly_role_name": "Admin"}]
+```
+
+Every entry has exactly these four keys, in this order, and every value is a string:
+
+| Key | Value |
+| --- | --- |
+| `idp` | ARN of the SAML identity provider for the role. |
+| `role` | ARN of the role. |
+| `friendly_account_name` | Display name of the account, or `""` when none is known. |
+| `friendly_role_name` | Display name of the role, or `""` when none is known. |
+
+Entries appear in the order the roles were discovered. If no roles are found, the output is `[]`. Non-ASCII characters are written as `\u` escapes, so the output is plain ASCII.
+
+For AWS, the friendly names are filled in only when alias resolution is on (`--resolve` or `resolve_aws_alias`); they come from the AWS sign-in page. For Alibaba Cloud, `friendly_account_name` is `Account: <account ID>` and `friendly_role_name` is the last part of the role ARN.
+
+The JSON holds no SAML assertion, Okta tokens or cloud credentials. Listing roles still needs a normal Okta sign-in; it stops before requesting cloud credentials.
+
+Only the command-line flag changes the role listing. The `output_format` setting and the `GIMME_AWS_CREDS_OUTPUT_FORMAT` environment variable apply to credential output only, and `-o export` keeps the text listing.
+
 ### Credential Expiration Time
 
 Writing to the AWS credentials file includes the `x_security_token_expires` value in RFC3339 format. Tools can use this to detect credentials that are expiring (or expired) and warn the user or trigger a refresh.
