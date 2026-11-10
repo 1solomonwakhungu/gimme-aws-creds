@@ -15,6 +15,7 @@ import reprlib
 import time
 import webbrowser
 from urllib.parse import parse_qs
+from urllib3.exceptions import ReadTimeoutError
 import jwt
 import requests
 
@@ -129,7 +130,9 @@ class OktaIdentityEngine(OktaHttpMixin):
         self._http_client = create_http_session(
             verify_ssl=verify_ssl_certs, debug=debug)
         self._http_client.cookies = requests.cookies.RequestsCookieJar()
-        token_url = self._okta_org_url + '/oauth2/v1/token'
+        # Requests chooses adapters after normalizing percent escapes and IDNA.
+        token_url = requests.Request(
+            'POST', self._okta_org_url + '/oauth2/v1/token').prepare().url
         self._http_client.mount(
             token_url, _DeviceTokenAdapter(self._http_client.get_adapter(token_url)))
     
@@ -273,7 +276,12 @@ class OktaIdentityEngine(OktaHttpMixin):
             except DeviceAuthorizationSlowDown:
                 interval += self.DEVICE_FLOW_SLOW_DOWN_INCREMENT
                 logger.debug("Token endpoint returned slow_down; polling interval is now %s seconds", interval)
-            except requests.exceptions.Timeout:
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                # Requests wraps timeouts while consuming response bodies in
+                # ConnectionError, unlike connect and response-header timeouts.
+                if not isinstance(exc, requests.exceptions.Timeout) and not (
+                        exc.args and isinstance(exc.args[0], ReadTimeoutError)):
+                    raise
                 interval *= 2
                 logger.debug("Token request timed out; polling interval is now %s seconds", interval)
             else:
@@ -379,13 +387,8 @@ class OktaIdentityEngine(OktaHttpMixin):
             saml_response, relay_state, form_action = parse_saml_form(response.text)
 
             if saml_response is None:
-                from bs4 import BeautifulSoup
-                saml_soup = BeautifulSoup(response.text, "html.parser")
-                saml_error = 'Did not receive SAML Response after successful authentication [' + url + ']'
-                if saml_soup.find(class_='error-content') is not None:
-                    saml_error += '\n' + saml_soup.find(class_='error-content').get_text()
-
-                raise errors.GimmeAWSCredsError(saml_error, 2)
+                raise errors.GimmeAWSCredsError(
+                    'Did not receive SAML Response after successful authentication', 2)
 
         else:
             response.raise_for_status()

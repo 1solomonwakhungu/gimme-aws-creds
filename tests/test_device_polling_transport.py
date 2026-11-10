@@ -4,6 +4,7 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
+import requests
 import urllib3
 
 from gimme_aws_creds.errors import GimmeAWSCredsError
@@ -93,6 +94,83 @@ class TestDevicePollingTransport(unittest.TestCase):
             self.poll(120)
         self.assertIn('Timeout waiting for device authorization', raised.exception.message)
         self.assertEqual([at for at, _ in self.attempts], [0, 10.25, 30.5, 70.75])
+
+    def stalled_body_response(self, duration):
+        owner = self
+
+        class StalledBody(io.BytesIO):
+            def read(self, *args, **kwargs):
+                owner.now += duration
+                raise TimeoutError('synthetic body read timeout')
+
+        return urllib3.response.HTTPResponse(
+            body=StalledBody(b'x'), status=200, preload_content=False)
+
+    def test_body_read_timeout_ends_with_cli_timeout_at_deadline(self):
+        self.transport(lambda pool, url, kwargs: self.stalled_body_response(
+            kwargs['timeout'].read_timeout))
+        with self.assertRaises(GimmeAWSCredsError) as raised:
+            self.poll(3)
+        self.assertIn('Timeout waiting for device authorization', raised.exception.message)
+        self.assertEqual(self.attempts, [(0, 3)])
+        self.assertEqual(self.sleeps, [])
+
+    def test_body_read_timeouts_reach_polling_backoff(self):
+        def outcome(pool, url, kwargs):
+            if len(self.attempts) < 3:
+                return self.stalled_body_response(0.25)
+            return self.response()
+
+        self.transport(outcome)
+        self.assertEqual(self.poll(60), {'access_token': 'synthetic'})
+        self.assertEqual([at for at, _ in self.attempts], [0, 10.25, 30.5])
+        self.assertEqual(self.sleeps, [10, 20])
+
+    def test_non_timeout_body_failure_is_not_retried(self):
+        class BrokenBody(io.BytesIO):
+            def read(self, *args, **kwargs):
+                raise OSError('synthetic connection failure')
+
+        self.transport(lambda *args: urllib3.response.HTTPResponse(
+            body=BrokenBody(b'x'), status=200, preload_content=False))
+        with self.assertRaises(requests.exceptions.ChunkedEncodingError) as raised:
+            self.poll(60)
+        self.assertIsInstance(raised.exception.args[0], urllib3.exceptions.ProtocolError)
+        self.assertEqual(len(self.attempts), 1)
+        self.assertEqual(self.sleeps, [])
+
+    def test_non_timeout_connection_error_is_not_retried(self):
+        error = requests.exceptions.ConnectionError('synthetic connection failure')
+        with patch.object(self.client._http_client, 'post', side_effect=error) as post:
+            with self.assertRaises(requests.exceptions.ConnectionError) as raised:
+                self.poll(60)
+        self.assertIs(raised.exception, error)
+        post.assert_called_once()
+        self.assertEqual(self.sleeps, [])
+
+    def test_prepared_urls_cannot_bypass_polling_retry_policy(self):
+        for org in ('https://%65xample.invalid', 'https://exámple.invalid'):
+            with self.subTest(org=org):
+                self.now = 0
+                self.attempts.clear()
+                self.sleeps.clear()
+                self.client = OktaIdentityEngine(Mock(), org, 'synthetic')
+                self.client._http_client.trust_env = False
+                self.addCleanup(self.client._http_client.close)
+                self.client._monotonic = lambda: self.now
+                self.client._sleep = self.sleep
+
+                def outcome(pool, url, kwargs):
+                    if len(self.attempts) == 1:
+                        self.now += kwargs['timeout'].connect_timeout
+                        raise urllib3.exceptions.ConnectTimeoutError('synthetic timeout')
+                    return self.response()
+
+                self.transport(outcome)
+                with self.assertRaises(GimmeAWSCredsError):
+                    self.poll(3)
+                self.assertEqual(self.attempts, [(0, 3)])
+                self.assertEqual(self.sleeps, [])
 
     def test_retry_after_cannot_hide_terminal_oauth_error(self):
         self.transport(lambda *args: self.response(
