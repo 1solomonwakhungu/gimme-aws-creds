@@ -140,13 +140,15 @@ The workflow cannot perform or fully confirm any of them.
    that limits who can create, update, or delete release tags. Add a branch
    ruleset that requires review for the default branch. The gate also checks
    that the release commit is reachable from the default branch.
-5. **Verify** with a release candidate tag on a fork or on TestPyPI (see
-   below) that the gate passes, that the `publish` job waits for reviewer
-   approval, and that PyPI accepts the OIDC exchange.
-6. **Enable publication** by creating the repository variable
-   `PYPI_PUBLISH_ENABLED` with the exact value `true`
-   (*Settings → Secrets and variables → Actions → Variables*). To stop
-   publication, delete the variable or change its value.
+5. **Rehearse separately**, if authorized, using the reviewed TestPyPI setup
+   described below. The production gate cannot pass while publication is
+   disabled; do not enable production merely to test the gate.
+6. **Enable production only after separate release authorization** by creating
+   the repository variable `PYPI_PUBLISH_ENABLED` with the exact value `true`
+   (*Settings → Secrets and variables → Actions → Variables*). Then verify
+   the authorized release's gate and protected-environment approval before
+   allowing publication. To disable publication, delete the variable or
+   change its value.
 
 ### What the gate checks
 
@@ -169,14 +171,27 @@ PyPI enforces the publisher tuple of repository, workflow, and environment when
 the `publish` job exchanges its OIDC token. A misconfigured publisher fails at
 upload, before anything is published.
 
-### Dry run against TestPyPI
+### Separately reviewed TestPyPI rehearsal
 
-To rehearse without touching the production project, do this on a personal
-fork. Register a TestPyPI Trusted Publisher for the fork and a `testpypi`
-environment configured as above. Then temporarily add
-`repository-url: https://test.pypi.org/legacy/` and that environment name in a
-fork-only branch. Do not merge that change. The policy test
-rejects `repository-url` in the main workflow on purpose.
+The production workflow deliberately rejects a different publish environment
+or a `repository-url` override. Editing those two values alone will fail its
+mandatory policy tests; this repository does not provide a ready-to-run
+TestPyPI workflow.
+
+A rehearsal requires separate authorization and a reviewed setup in a dedicated
+fork. That setup must change both the readiness check's environment lookup and
+the publish job's environment to `testpypi`, register the corresponding
+TestPyPI publisher tuple, and allow only
+`https://test.pypi.org/legacy/` in its rehearsal-specific workflow policy.
+Preserve all other checks and leave the production policy unchanged.
+
+The rehearsal commit must be reachable from that fork's default branch to pass
+the ancestry gate. Enable the rehearsal's gate before expecting it to pass,
+using a variable confined to that fork, and require its protected environment's
+review approval. Verify tested artifact hashes and the TestPyPI OIDC exchange
+there. Do not merge rehearsal endpoint or policy changes into the production
+workflow. No rehearsal, publisher registration, enablement, or upload has been
+performed as part of this change.
 
 ## Local reproduction
 
