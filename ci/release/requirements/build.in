@@ -1,0 +1,7 @@
+# Tools used to build the release wheel and sdist exactly once.
+# pyproject.toml declares setuptools and setuptools-rust as build requirements;
+# the workflow builds with --no-isolation so only these hash-locked versions are used.
+build
+setuptools
+setuptools-rust
+packaging

@@ -1,0 +1,2 @@
+# Dependency auditor used against the dependency set resolved from the built wheel.
+pip-audit
