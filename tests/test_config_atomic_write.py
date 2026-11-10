@@ -1,11 +1,15 @@
 """Tests for atomic, owner-only writes of the Okta configuration file."""
+import ctypes
+import errno
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from gimme_aws_creds import config as config_module
 from gimme_aws_creds.config import Config
 from gimme_aws_creds.errors import GimmeAWSCredsError
 from tests.user_interface_mock import MockUserInterface
@@ -661,6 +665,368 @@ class AtomicConfigWriteTest(unittest.TestCase):
         fchown.assert_not_called()
         self.assertEqual(config.get_config_dict()['client_id'], 'windows')
         self.assertEqual(self.leftovers(), [])
+
+
+DARWIN = sys.platform == 'darwin'
+# An ordinary inheritable ACL entry giving everyone the directory rights an
+# attacker needs to replace entries: list, add_file, search, add_subdirectory
+# and delete_child (named read, write, execute, append, delete_child in text).
+EVERYONE_INHERITABLE = (
+    b'!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:'
+    b'allow,file_inherit,directory_inherit:read,write,execute,append,delete_child\n')
+# The same rights set directly (not inherited) on one directory.
+EVERYONE_EXPLICIT = (
+    b'!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:'
+    b'allow:read,write,execute,append,delete_child\n')
+
+
+class DarwinAcl:
+    """Test-side access to real macOS extended ACLs of test-owned files."""
+    TYPE_EXTENDED = 0x00000100
+
+    def __init__(self):
+        lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+        lib.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        lib.acl_get_fd_np.restype = ctypes.c_void_p
+        lib.acl_set_fd_np.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        lib.acl_set_fd_np.restype = ctypes.c_int
+        lib.acl_from_text.argtypes = [ctypes.c_char_p]
+        lib.acl_from_text.restype = ctypes.c_void_p
+        lib.acl_to_text.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.acl_to_text.restype = ctypes.c_void_p
+        lib.acl_free.argtypes = [ctypes.c_void_p]
+        self.lib = lib
+
+    def set(self, fd, text):
+        acl = self.lib.acl_from_text(text)
+        if not acl:
+            raise OSError(ctypes.get_errno(), 'acl_from_text')
+        try:
+            if self.lib.acl_set_fd_np(fd, acl, self.TYPE_EXTENDED) != 0:
+                raise OSError(ctypes.get_errno(), 'acl_set_fd_np')
+        finally:
+            self.lib.acl_free(acl)
+
+    def set_path(self, path, text):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            self.set(fd, text)
+        finally:
+            os.close(fd)
+
+    def text(self, fd):
+        """The ACL of ``fd`` as text, or '' if it has none."""
+        ctypes.set_errno(0)
+        acl = self.lib.acl_get_fd_np(fd, self.TYPE_EXTENDED)
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return ''
+            raise OSError(ctypes.get_errno(), 'acl_get_fd_np')
+        try:
+            text = self.lib.acl_to_text(acl, None)
+            try:
+                return ctypes.string_at(text).decode()
+            finally:
+                self.lib.acl_free(text)
+        finally:
+            self.lib.acl_free(acl)
+
+    def text_path(self, path):
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            return self.text(fd)
+        finally:
+            os.close(fd)
+
+    def everyone_may_replace_entries(self, fd):
+        """Whether the ACL lets every user add and delete entries in directory ``fd``.
+
+        These are the rights a lower-privileged user would use; the process
+        running the test holds them anyway as the owner, so this decides
+        whether the simulated attacker's action would be permitted.
+        """
+        for line in self.text(fd).splitlines()[1:]:
+            fields = line.split(':')
+            if fields[2] == 'everyone' and fields[4].split(',')[0] == 'allow':
+                rights = fields[5].split(',')
+                if {'write', 'execute', 'delete_child'} <= set(rights):
+                    return True
+        return False
+
+
+@unittest.skipUnless(POSIX and not IS_ROOT, 'POSIX staging as non-root')
+class StagingAclTest(unittest.TestCase):
+    """Access granted by ACLs inherited by the staging directory."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='gac-acl-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.acl = DarwinAcl() if DARWIN else None
+
+    def inheriting_home(self, name):
+        """A test-owned directory whose new children inherit EVERYONE_INHERITABLE."""
+        home = self.root / name
+        home.mkdir(mode=0o700)
+        self.acl.set_path(home, EVERYONE_INHERITABLE)
+        # Remove the ACL before the temporary directory is cleaned up.
+        self.addCleanup(self.clear_acls, home)
+        return home
+
+    def clear_acls(self, top):
+        if not top.exists():
+            return
+        for path in [top, *top.rglob('*')]:
+            if not path.is_symlink():
+                self.acl.set_path(path, b'!#acl 1\n')
+
+    def write(self, path, value='new'):
+        ui = RecordingUserInterface(str(path.parent), {'OKTA_CONFIG': str(path)})
+        Config(gac_ui=ui, create_config=False).write_config_file({'client_id': value})
+
+    def destination(self, home):
+        path = home / 'config'
+        path.write_text('[DEFAULT]\nclient_id = original\n')
+        os.chmod(path, 0o600)
+        victim = home / 'victim'
+        victim.write_text('victim data')
+        return path, victim
+
+    @unittest.skipUnless(DARWIN, 'macOS extended ACLs')
+    def test_inherited_acl_cannot_substitute_the_staged_file(self):
+        # A real inherited ACL on the staging directory. The attacker opens
+        # the new staging directory as soon as it exists (the ACL lets every
+        # user search it) and keeps that descriptor. Immediately before the
+        # writer's rename it replaces the staged file through the descriptor,
+        # with a 0644 file or a symlink, if the directory's ACL at that moment
+        # gives every user the rights to do so.
+        for kind in ('regular', 'symlink'):
+            with self.subTest(planted=kind):
+                home = self.inheriting_home(kind)
+                parent_acl = self.acl.text_path(home)
+                path, victim = self.destination(home)
+                real_mkdir, real_replace = os.mkdir, os.replace
+                attacker = {}
+                at_commit = {}
+
+                def mkdir(entry, *args, **kwargs):
+                    real_mkdir(entry, *args, **kwargs)
+                    if kwargs.get('dir_fd') is not None:
+                        attacker['fd'] = os.open(entry, os.O_RDONLY | os.O_DIRECTORY,
+                                                 dir_fd=kwargs['dir_fd'])
+                        self.addCleanup(os.close, attacker['fd'])
+                        attacker['acl_at_open'] = self.acl.text(attacker['fd'])
+
+                def replace(src, dst, *args, **kwargs):
+                    fd = attacker['fd']
+                    stage = kwargs['src_dir_fd']
+                    at_commit.update(
+                        stage_acl=self.acl.text(stage),
+                        stage_mode=stat.S_IMODE(os.fstat(stage).st_mode),
+                        same_directory=os.path.samestat(os.fstat(fd), os.fstat(stage)))
+                    staged = os.open(src, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=stage)
+                    at_commit.update(file_acl=self.acl.text(staged),
+                                     file_mode=stat.S_IMODE(os.fstat(staged).st_mode))
+                    os.close(staged)
+                    attacker['permitted'] = self.acl.everyone_may_replace_entries(fd)
+                    if attacker['permitted']:
+                        os.unlink(src, dir_fd=fd)
+                        if kind == 'symlink':
+                            os.symlink(str(victim), src, dir_fd=fd)
+                        else:
+                            planted = os.open(src, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644,
+                                              dir_fd=fd)
+                            os.write(planted, b'[DEFAULT]\nclient_id = ATTACKER\n')
+                            os.close(planted)
+                    result = real_replace(src, dst, *args, **kwargs)
+                    at_commit.update(link=path.is_symlink(), text=path.read_text(),
+                                     mode=stat.S_IMODE(os.lstat(path).st_mode))
+                    return result
+
+                outcome = None
+                with patch('gimme_aws_creds.config.os.mkdir', side_effect=mkdir), \
+                        patch('gimme_aws_creds.config.os.replace', side_effect=replace):
+                    try:
+                        self.write(path)
+                    except GimmeAWSCredsError as exc:
+                        outcome = exc
+                # The fixture really was inherited by the new staging directory.
+                self.assertIn('everyone', attacker['acl_at_open'])
+                self.assertIn('inherited', attacker['acl_at_open'])
+                self.assertTrue(at_commit['same_directory'])
+                # What the writer's own rename published, before later checks.
+                self.assertFalse(at_commit['link'], outcome)
+                self.assertNotIn('ATTACKER', at_commit['text'])
+                self.assertNotIn('victim', at_commit['text'])
+                self.assertIn('new', at_commit['text'])
+                self.assertEqual(at_commit['mode'], 0o600)
+                # Nobody but the owner had access to the directory or the file.
+                self.assertEqual(at_commit['stage_acl'], '')
+                self.assertEqual(at_commit['stage_mode'], 0o700)
+                self.assertEqual(at_commit['file_acl'], '')
+                self.assertEqual(at_commit['file_mode'], 0o600)
+                self.assertFalse(attacker['permitted'])
+                self.assertIsNone(outcome)
+                self.assertIn('new', path.read_text())
+                self.assertEqual(victim.read_text(), 'victim data')
+                self.assertEqual(self.acl.text_path(path), '')
+                # The destination directory's own ACL is left as it was.
+                self.assertEqual(self.acl.text_path(home), parent_acl)
+                self.assertEqual([p.name for p in home.iterdir() if p.name.endswith('.tmp')], [])
+
+    @unittest.skipUnless(DARWIN, 'macOS extended ACLs')
+    def test_secret_is_written_only_once_the_staged_file_is_private(self):
+        home = self.inheriting_home('privacy')
+        path, _ = self.destination(home)
+        real_fsync = os.fsync
+        seen = []
+
+        def fsync(fd):
+            # The data has been written to the staged file at this point.
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                seen.append((self.acl.text(fd), stat.S_IMODE(os.fstat(fd).st_mode)))
+            return real_fsync(fd)
+
+        with patch('gimme_aws_creds.config.os.fsync', side_effect=fsync):
+            self.write(path, 'secret')
+        self.assertEqual(seen, [('', 0o600)])
+        self.assertIn('secret', path.read_text())
+
+    @unittest.skipUnless(DARWIN, 'macOS extended ACLs')
+    def test_entries_added_before_the_acl_is_removed_are_refused(self):
+        # While the inherited ACL is still in place, every user may add
+        # entries. Anything added before it is removed must be found.
+        for kind in ('regular', 'symlink', 'directory'):
+            with self.subTest(planted=kind):
+                home = self.inheriting_home('window-' + kind)
+                path, victim = self.destination(home)
+                real_clear = config_module._DarwinACL.clear
+                planted = []
+
+                def clear(api, fd):
+                    self.assertTrue(self.acl.everyone_may_replace_entries(fd))
+                    entry = STAGED_FILE_NAME
+                    if kind == 'regular':
+                        handle = os.open(entry, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644,
+                                         dir_fd=fd)
+                        os.write(handle, b'ATTACKER')
+                        os.close(handle)
+                    elif kind == 'symlink':
+                        os.symlink(str(victim), entry, dir_fd=fd)
+                    else:
+                        os.mkdir(entry, 0o777, dir_fd=fd)
+                    planted.append(kind)
+                    return real_clear(api, fd)
+
+                with patch.object(config_module._DarwinACL, 'clear', autospec=True,
+                                  side_effect=clear):
+                    with self.assertRaisesRegex(GimmeAWSCredsError, 'staging directory .* replaced'):
+                        self.write(path)
+                self.assertEqual(planted, [kind])
+                self.assertFalse(path.is_symlink())
+                self.assertEqual(path.read_text(), '[DEFAULT]\nclient_id = original\n')
+                self.assertEqual(victim.read_text(), 'victim data')
+
+    @unittest.skipUnless(DARWIN, 'macOS extended ACLs')
+    def test_directory_with_explicit_acl_entries_is_refused_and_left_alone(self):
+        # Only a directory put in place of the new one can have entries that
+        # were not inherited; its ACL must not be changed.
+        home = self.root / 'explicit'
+        home.mkdir(mode=0o700)
+        path, _ = self.destination(home)
+        self.addCleanup(self.clear_acls, home)
+        real_mkdir = os.mkdir
+        made = []
+
+        def mkdir(entry, *args, **kwargs):
+            real_mkdir(entry, *args, **kwargs)
+            if kwargs.get('dir_fd') is not None:
+                fd = os.open(entry, os.O_RDONLY | os.O_DIRECTORY, dir_fd=kwargs['dir_fd'])
+                try:
+                    self.acl.set(fd, EVERYONE_EXPLICIT)
+                finally:
+                    os.close(fd)
+                made.append(home / entry)
+
+        with patch('gimme_aws_creds.config.os.mkdir', side_effect=mkdir):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'staging directory .* replaced'):
+                self.write(path)
+        (stage,) = made
+        text = self.acl.text_path(stage)
+        self.assertIn('everyone', text)
+        self.assertNotIn('inherited', text)
+        self.assertEqual(path.read_text(), '[DEFAULT]\nclient_id = original\n')
+
+    @unittest.skipUnless(DARWIN, 'macOS extended ACLs')
+    def test_acl_that_cannot_be_removed_is_refused(self):
+        def fail(api, fd):
+            raise OSError(errno.EPERM, os.strerror(errno.EPERM))
+
+        for name, effect, message in (
+                ('fails', fail, os.strerror(errno.EPERM)),
+                ('ignored', lambda api, fd: None, 'still present')):
+            with self.subTest(clear=name):
+                home = self.inheriting_home('stuck-' + name)
+                path, _ = self.destination(home)
+                with patch.object(config_module._DarwinACL, 'clear', autospec=True,
+                                  side_effect=effect):
+                    with self.assertRaisesRegex(GimmeAWSCredsError, 'cannot remove the access '
+                                                'control list .*' + message):
+                        self.write(path)
+                self.assertEqual(path.read_text(), '[DEFAULT]\nclient_id = original\n')
+                self.assertEqual([p.name for p in home.iterdir() if p.name.endswith('.tmp')], [])
+
+    def test_platform_whose_acls_cannot_be_checked_is_refused(self):
+        home = self.root / 'unsupported'
+        home.mkdir(mode=0o700)
+        path, _ = self.destination(home)
+        for policy in (None, 'darwin'):
+            with self.subTest(policy=policy):
+                ui = RecordingUserInterface(str(home), {'OKTA_CONFIG': str(path)})
+                config = Config(gac_ui=ui, create_config=False)
+                # 'darwin': libSystem's ACL functions could not be loaded.
+                with patch('gimme_aws_creds.config._ACL_POLICY', policy), \
+                        patch('gimme_aws_creds.config._darwin_acl_api', return_value=None), \
+                        patch('gimme_aws_creds.config.os.mkdir') as mkdir:
+                    with self.assertRaisesRegex(GimmeAWSCredsError,
+                                                'access control lists cannot be checked'):
+                        config.write_config_file({'client_id': 'new'})
+                mkdir.assert_not_called()
+                self.assertEqual(path.read_text(), '[DEFAULT]\nclient_id = original\n')
+
+    def test_linux_refuses_nfs4_acls_and_unreadable_acls(self):
+        home = self.root / 'linux'
+        home.mkdir(mode=0o700)
+        path, _ = self.destination(home)
+        checked = []
+
+        def no_acl(fd, name):
+            checked.append((stat.S_IFMT(os.fstat(fd).st_mode), name))
+            raise OSError(errno.ENODATA, 'No data available')
+
+        def io_error(fd, name):
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        for name, effect, error in (('none', no_acl, None),
+                                    ('nfs4', lambda fd, name: b'\0\0\0\1', 'NFSv4'),
+                                    ('unreadable', io_error, os.strerror(errno.EIO))):
+            with self.subTest(acl=name):
+                with patch('gimme_aws_creds.config._ACL_POLICY', 'linux'), \
+                        patch.object(config_module.os, 'getxattr', create=True,
+                                     side_effect=effect):
+                    if error is None:
+                        self.write(path, 'linux')
+                    else:
+                        with self.assertRaisesRegex(GimmeAWSCredsError, error):
+                            self.write(path, 'refused')
+                self.assertIn('linux', path.read_text())
+                self.assertEqual([p.name for p in home.iterdir() if p.name.endswith('.tmp')], [])
+        # The staging directory, the staged file before it is written, and
+        # both again before the rename.
+        self.assertEqual(checked, [(stat.S_IFDIR, 'system.nfs4_acl'),
+                                   (stat.S_IFREG, 'system.nfs4_acl'),
+                                   (stat.S_IFDIR, 'system.nfs4_acl'),
+                                   (stat.S_IFREG, 'system.nfs4_acl')])
 
 
 if __name__ == '__main__':

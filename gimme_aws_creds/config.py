@@ -16,6 +16,7 @@ import io
 import os
 import secrets
 import stat
+import sys
 
 import requests
 from urllib.parse import urlparse
@@ -29,6 +30,96 @@ from .common import user_agent
 _DIR_FD_SUPPORTED = (
     {os.open, os.lstat, os.readlink, os.rename, os.unlink, os.mkdir, os.rmdir} <= os.supports_dir_fd
     and os.listdir in os.supports_fd)
+
+# How the config writer keeps access granted by access control lists (ACLs)
+# off its staging directory; see Config._write_private_config.
+if sys.platform == 'darwin':
+    _ACL_POLICY = 'darwin'
+elif sys.platform.startswith('linux'):
+    _ACL_POLICY = 'linux'
+else:
+    _ACL_POLICY = None
+
+
+class _DarwinACL:
+    """Extended ACLs of open files, through the acl(3) functions in libSystem."""
+    _TYPE_EXTENDED = 0x00000100
+    _FIRST_ENTRY = 0
+    _NEXT_ENTRY = -1
+    _ENTRY_INHERITED = 1 << 4
+
+    def __init__(self):
+        import ctypes
+        self._ctypes = ctypes
+        lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+        pointer, integer = ctypes.c_void_p, ctypes.c_int
+        for name, restype, argtypes in (
+                ('acl_get_fd_np', pointer, [integer, integer]),
+                ('acl_set_fd_np', integer, [integer, pointer, integer]),
+                ('acl_init', pointer, [integer]),
+                ('acl_get_entry', integer, [pointer, integer, ctypes.POINTER(pointer)]),
+                ('acl_get_flagset_np', integer, [pointer, ctypes.POINTER(pointer)]),
+                ('acl_get_flag_np', integer, [pointer, integer]),
+                ('acl_free', integer, [pointer])):
+            function = getattr(lib, name)
+            function.restype = restype
+            function.argtypes = argtypes
+        self._lib = lib
+
+    def _error(self):
+        code = self._ctypes.get_errno()
+        return OSError(code, os.strerror(code))
+
+    def entries(self, fd):
+        """Return one flag per ACL entry of ``fd``: whether it was inherited."""
+        ctypes, lib = self._ctypes, self._lib
+        ctypes.set_errno(0)
+        acl = lib.acl_get_fd_np(fd, self._TYPE_EXTENDED)
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return []  # the file has no extended ACL
+            raise self._error()
+        try:
+            inherited = []
+            entry, flagset = ctypes.c_void_p(), ctypes.c_void_p()
+            which = self._FIRST_ENTRY
+            # acl_get_entry() fails (EINVAL) after the last entry.
+            while lib.acl_get_entry(acl, which, ctypes.byref(entry)) == 0:
+                which = self._NEXT_ENTRY
+                if lib.acl_get_flagset_np(entry, ctypes.byref(flagset)) != 0:
+                    raise self._error()
+                flag = lib.acl_get_flag_np(flagset, self._ENTRY_INHERITED)
+                if flag < 0:
+                    raise self._error()
+                inherited.append(bool(flag))
+            return inherited
+        finally:
+            lib.acl_free(acl)
+
+    def clear(self, fd):
+        """Replace the extended ACL of ``fd`` with an empty one."""
+        acl = self._lib.acl_init(0)
+        if not acl:
+            raise self._error()
+        try:
+            if self._lib.acl_set_fd_np(fd, acl, self._TYPE_EXTENDED) != 0:
+                raise self._error()
+        finally:
+            self._lib.acl_free(acl)
+
+
+_darwin_acl = None
+
+
+def _darwin_acl_api():
+    """Return the shared _DarwinACL, or None if libSystem does not provide it."""
+    global _darwin_acl
+    if _darwin_acl is None:
+        try:
+            _darwin_acl = _DarwinACL()
+        except (ImportError, OSError, AttributeError):
+            return None
+    return _darwin_acl
 
 
 class Config:
@@ -550,12 +641,35 @@ class Config:
         directory (not a directory, not owned by the current user, not
         private, or not empty) is refused before anything is written.
 
+        ACLs. A new directory can inherit ACL entries from its parent that
+        grant other users access its 0700 mode does not show, so the staging
+        directory's ACL is dealt with before it is checked and used:
+
+        * macOS: the extended ACL is read and removed through the directory's
+          descriptor (acl_get_fd_np/acl_set_fd_np) and read again to confirm
+          it is gone. Permissions are checked on every operation, so users it
+          named lose access at once, even through descriptors they opened
+          earlier; entries they created or a move of the directory meanwhile
+          are refused by the checks that follow. A directory with entries that
+          were not inherited is not the one just made, so it is refused and
+          its ACL left alone. ACLs of the destination and its directories are
+          never changed.
+        * Linux: POSIX.1e ACL entries for named users and groups are limited
+          by the ACL mask, which is the group mode bits, and those are zero.
+          NFSv4 ACLs (system.nfs4_acl) are not limited that way and are
+          refused.
+        * Other POSIX systems: refused, as their ACLs cannot be checked.
+
+        The staged file's mode and ACL are checked before anything is written
+        to it, and the directory and file again before the rename.
+
         Not covered: processes running as the same user or as root, which can
-        change anything this process can; access granted through ACLs, which
-        are not inspected; and filesystems that do not enforce POSIX
-        ownership and modes. A link is refused if it changes while it is read,
-        but once the destination entry is chosen another user who can write to
-        its directory can still replace that entry, so success means the new
+        change anything this process can; network filesystems whose server
+        grants access the local modes and ACLs do not show; and filesystems
+        that do not enforce POSIX ownership and modes. A link is refused if it
+        changes while it is read, but once the destination entry is chosen
+        another user who can write to its directory can still replace that
+        entry, so success means the new
         file was published where the path pointed when it was resolved. The
         write fails, after publishing, if the published file or a pinned
         directory no longer matches. POSIX systems without the descriptor
@@ -573,6 +687,8 @@ class Config:
             raise errors.GimmeAWSCredsError(
                 'Refusing to write configuration file {}: this platform cannot open '
                 'directories safely'.format(path))
+        if posix:
+            self._require_acl_support(path)
         pinned = posix
         opened = []
         try:
@@ -718,6 +834,7 @@ class Config:
         flags = (os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | os.O_NOFOLLOW
                  | getattr(os, 'O_CLOEXEC', 0))
         fd = None
+        ours = False
         try:
             try:
                 fd = os.open(entry, flags, dir_fd=dir_fd)
@@ -726,18 +843,38 @@ class Config:
                 if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
                     raise refuse() from exc
                 raise
-            st = os.fstat(fd)
+
+            def private_and_empty():
+                st = os.fstat(fd)
+                return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid()
+                        and not stat.S_IMODE(st.st_mode) & 0o077 and not os.listdir(fd))
+
             # mkdir() made it 0700 (less any umask bits), so group/other bits,
             # another owner or existing entries mean this is not that directory.
-            if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
-                    or stat.S_IMODE(st.st_mode) & 0o077 or os.listdir(fd)):
+            if not private_and_empty():
                 raise refuse()
-            if stat.S_IMODE(st.st_mode) != 0o700:
+            # From here on it is our directory (with the explicit-entry
+            # exception below), so a failure removes it.
+            ours = True
+            if not self._drop_inherited_acl(path, display, fd):
+                # A new directory only has inherited ACL entries: this one was
+                # put in its place, and neither it nor its ACL is ours.
+                ours = False
+                raise refuse()
+            # Until the inherited ACL was removed, the principals it named
+            # could add entries here or move the directory; they no longer
+            # can, and anything they did is caught now.
+            if not private_and_empty() or not self._is_same_file(entry, dir_fd, os.fstat(fd)):
+                raise refuse()
+            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
                 # The umask removed owner bits this process needs.
                 os.fchmod(fd, 0o700)
         except errors.GimmeAWSCredsError:
-            # Whatever is there now is not ours to remove.
-            if fd is not None:
+            if ours:
+                # Our empty directory, checked by identity before removal.
+                self._discard_new_staging_directory(entry, dir_fd, fd)
+            elif fd is not None:
+                # Whatever is there now is not ours to remove.
                 os.close(fd)
             raise
         except BaseException:
@@ -745,6 +882,75 @@ class Config:
             self._discard_new_staging_directory(entry, dir_fd, fd)
             raise
         return display, fd
+
+    def _require_acl_support(self, path):
+        """Refuse platforms where ACLs on the staging directory cannot be ruled out."""
+        if _ACL_POLICY == 'darwin' and _darwin_acl_api() is not None:
+            return
+        if _ACL_POLICY == 'linux':
+            return
+        raise errors.GimmeAWSCredsError(
+            'Refusing to write configuration file {}: access control lists cannot be '
+            'checked on this platform'.format(path))
+
+    @staticmethod
+    def _has_nfs4_acl(fd):
+        """Whether ``fd`` has an NFSv4 ACL, which Linux file modes do not limit."""
+        try:
+            os.getxattr(fd, 'system.nfs4_acl')
+        except OSError as exc:
+            if exc.errno in (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP):
+                return False
+            raise
+        return True
+
+    def _acl_may_grant_access(self, fd):
+        """Whether an ACL may give others access to ``fd`` despite an owner-only mode."""
+        if _ACL_POLICY == 'darwin':
+            return bool(_darwin_acl_api().entries(fd))
+        # POSIX.1e ACLs: the group mode bits are the ACL mask, which limits
+        # every named user and group entry; callers require them to be zero.
+        return self._has_nfs4_acl(fd)
+
+    def _drop_inherited_acl(self, path, display, fd):
+        """Remove the ACL the new staging directory inherited from its parent.
+
+        Returns False, changing nothing, if the directory has ACL entries that
+        were not inherited; raises if the ACL cannot be removed.
+        """
+        def failed(reason):
+            return errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: cannot remove the access control '
+                'list its staging directory {} inherited ({})'.format(path, display, reason))
+
+        if _ACL_POLICY != 'darwin':
+            # Linux: POSIX.1e ACLs are bounded by the 0700 mode; refuse the
+            # NFSv4 ACLs that are not.
+            try:
+                if self._has_nfs4_acl(fd):
+                    raise failed('NFSv4 ACLs are not limited by file modes')
+            except OSError as exc:
+                raise failed(exc.strerror) from exc
+            return True
+        acl = _darwin_acl_api()
+        try:
+            inherited = acl.entries(fd)
+            if not all(inherited):
+                return False
+            if inherited:
+                acl.clear(fd)
+                if acl.entries(fd):
+                    raise failed('it is still present')
+        except OSError as exc:
+            raise failed(exc.strerror) from exc
+        return True
+
+    def _require_private(self, path, fd):
+        """Refuse to go on if others can reach ``fd`` through its mode or an ACL."""
+        if stat.S_IMODE(os.fstat(fd).st_mode) & 0o077 or self._acl_may_grant_access(fd):
+            raise errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: its staging area became accessible '
+                'to other users'.format(path))
 
     @staticmethod
     def _discard_new_staging_directory(entry, dir_fd, fd):
@@ -794,14 +1000,20 @@ class Config:
                     self._preserve_ownership(handle.fileno(), existing, path)
                 # Apply the mode explicitly: open() is subject to umask.
                 os.fchmod(handle.fileno(), mode)
+                # Nothing is written until the file is known to be private.
+                self._require_private(path, handle.fileno())
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
             if not posix:
                 # Windows does not allow renaming this file while it is open.
                 handle.close()
-            # Only the same user or root can reach inside the staging directory;
-            # this catches such a change made before the rename, not during it.
+            # Only the same user or root can reach inside the staging directory,
+            # whose inherited ACL was removed; this catches such a change made
+            # before the rename, not during it.
+            if posix:
+                self._require_private(path, temp_dir_fd)
+                self._require_private(path, handle.fileno())
             if posix and not self._is_same_file(temp_entry, temp_dir_fd, written):
                 raise errors.GimmeAWSCredsError(
                     'Refusing to replace configuration file {}: the temporary file was '
