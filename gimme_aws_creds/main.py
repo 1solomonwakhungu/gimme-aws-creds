@@ -185,7 +185,70 @@ class GimmeAWSCreds:
         os.chmod(credentials_file, 0o600)
         self.ui.message('Written profile {} to {}'.format(profile, credentials_file))
 
+    # Fields that must be set before a credentials record of each type is written.
+    _REQUIRED_CREDENTIAL_FIELDS = {
+        'aws': ('aws_access_key_id',
+                'aws_secret_access_key',
+                'aws_session_token',
+                'expiration'),
+        'alibaba_cloud': ('access_key_id',
+                          'access_key_secret',
+                          'security_token',
+                          'expiration',
+                          'region_id'),
+    }
+
+    # Alibaba Cloud fields that never appear in AWS records.
+    _ALIBABA_CLOUD_ONLY_FIELDS = ('access_key_id', 'access_key_secret', 'security_token', 'region_id')
+
+    @classmethod
+    def _resolve_credentials_type(cls, credentials):
+        """Return ``(credentials_type, error)`` for a credentials record.
+
+        Records written before Alibaba Cloud support carry no ``credentials_type``
+        and are AWS records. An untyped record that contains Alibaba Cloud fields
+        is ambiguous and rejected rather than guessed. Error messages name fields,
+        never their values.
+        """
+        if 'credentials_type' not in credentials:
+            alibaba_fields = [key for key in cls._ALIBABA_CLOUD_ONLY_FIELDS if key in credentials]
+            if alibaba_fields:
+                return None, ('credentials_type is not set and credentials contain Alibaba Cloud fields {}; '
+                              'set credentials_type explicitly'.format(', '.join(alibaba_fields)))
+            return 'aws', None
+
+        credentials_type = credentials['credentials_type']
+        if isinstance(credentials_type, str) and credentials_type in cls._REQUIRED_CREDENTIAL_FIELDS:
+            return credentials_type, None
+        return None, 'credentials_type is not supported; expected one of: {}'.format(
+            ', '.join(cls._REQUIRED_CREDENTIAL_FIELDS))
+
     def write_credentials_from_data(self, data, credentials_file=None):
+        """Validate a credentials record and write it to its provider's credentials file.
+
+        The record's ``credentials_type`` selects the provider, its required fields and
+        its writer, independent of whether the active profile enables Alibaba Cloud.
+        Records without ``credentials_type`` (output of releases before Alibaba Cloud
+        support) are AWS records.
+
+        The destination is ``credentials_file`` if set, otherwise the record's
+        ``shared_credentials_file``, otherwise the provider's default file.
+        Invalid records are reported as warnings and nothing is written.
+        """
+        self._write_credentials_record(data, credentials_file)
+
+    def write_aws_creds_from_data(self, data, aws_config=None):
+        """Write an AWS credentials record; kept for scripts using the original API.
+
+        The destination is ``aws_config`` if set, otherwise the record's
+        ``shared_credentials_file``, otherwise ``AWS_SHARED_CREDENTIALS_FILE`` or
+        ``~/.aws/credentials``. Records with a ``credentials_type`` other than
+        ``aws`` are rejected without writing; use ``write_credentials_from_data``
+        for Alibaba Cloud records.
+        """
+        self._write_credentials_record(data, aws_config, required_type='aws')
+
+    def _write_credentials_record(self, data, credentials_file, required_type=None):
         if not isinstance(data, dict):
             self.ui.warning('json line is not a dict! ' + repr(data))
             return
@@ -203,45 +266,45 @@ class GimmeAWSCreds:
                 if not value:
                     errs.append('{} is not set {} in profile! {}'.format(key, repr(value), str(profile.keys())))
 
+        credentials_type = None
         if not isinstance(credentials, dict):
             errs.append('credentials are not a dict!' + repr(credentials))
         else:
-            if self._alicloud_enabled() is True:
-                for key in ('access_key_id',
-                            'access_key_secret',
-                            'security_token',
-                            'expiration'):
-                    value = credentials.get(key, None)
-                    if not value:
-                        errs.append('{} is not set {} in credentials! {}'.format(key, repr(value), str(credentials.keys())))
+            credentials_type, type_error = self._resolve_credentials_type(credentials)
+            if type_error:
+                errs.append(type_error)
+            elif required_type is not None and credentials_type != required_type:
+                errs.append('expected credentials_type {!r}, got {!r}; use write_credentials_from_data '
+                            'to store credentials for other providers'.format(required_type, credentials_type))
             else:
-                for key in ('aws_access_key_id',
-                            'aws_secret_access_key',
-                            'aws_session_token',
-                            'expiration'):
+                for key in self._REQUIRED_CREDENTIAL_FIELDS[credentials_type]:
                     value = credentials.get(key, None)
                     if not value:
                         errs.append(
                             '{} is not set {} in credentials! {}'.format(key, repr(value), str(credentials.keys())))
+
+        if credentials_file and not isinstance(credentials_file, (str, bytes, os.PathLike)):
+            errs.append('credentials file destination is not a path: {}'.format(type(credentials_file).__name__))
 
         if errs:
             for error in errs:
                 self.ui.warning(error)
             return
 
-        arn = data.get('role', {}).get('arn', '<no-arn>')
+        role = data.get('role')
+        arn = role.get('arn', '<no-arn>') if isinstance(role, dict) else '<no-arn>'
         self.ui.message('Saving {} as {}'.format(arn, profile['name']))
-        
-        if credentials['credentials_type'] == 'aws':
+
+        if credentials_type == 'aws':
             self._write_aws_credentials(
-            profile['name'],
-            credentials['aws_access_key_id'],
-            credentials['aws_secret_access_key'],
-            credentials['aws_session_token'],
-            credentials['expiration'],
-            credentials_file=credentials_file,
-        )
-        elif credentials['credentials_type'] == 'alibaba_cloud':
+                profile['name'],
+                credentials['aws_access_key_id'],
+                credentials['aws_secret_access_key'],
+                credentials['aws_session_token'],
+                credentials['expiration'],
+                credentials_file=credentials_file,
+            )
+        else:
             self._write_alibaba_cloud_credentials(
                 profile['name'],
                 credentials['access_key_id'],
@@ -251,8 +314,6 @@ class GimmeAWSCreds:
                 credentials['region_id'],
                 credentials_file=credentials_file,
             )
-        else:
-            raise errors.GimmeAWSCredsError("Unknown credentials type: {}".format(credentials['credentials_type']))
 
     _ACS_PARTITIONS = [
         ('signin.aws.amazon.com/saml', 'aws', 'us-east-1'),
