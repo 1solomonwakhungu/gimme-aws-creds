@@ -206,6 +206,7 @@ jobs:
           cd "$RUNNER_TEMP/unit"
           HOME="$RUNNER_TEMP/home" "$RUNNER_TEMP/artifact/bin/python" -m pytest -p no:cacheprovider -q tests \
             --ignore=tests/test_build_verification.py \
+            --deselect tests/test_cli_first_run.py::TestSourceEntryPointFirstRun \
             --deselect tests/test_keyring_integration.py::TestKeyringAPIs::test_keyring_password_operations
 
   release-gate:

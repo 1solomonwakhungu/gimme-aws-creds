@@ -183,3 +183,17 @@ def test_publish_uploads_only_verified_artifacts_via_oidc(jobs):
     assert inputs["packages-dir"] == "dist/"
     assert inputs["attestations"] is True
     assert not {"user", "password", "repository-url"} & set(inputs)
+
+
+def test_installed_wheel_keeps_guard_and_installed_cli_tests(jobs):
+    steps = jobs["verify-artifacts"]["steps"]
+    run = next(step["run"] for step in steps
+               if step.get("name") == "Run unit tests against the installed wheel")
+    assert "--deselect tests/test_cli_first_run.py::TestSourceEntryPointFirstRun" in run
+    assert "--ignore=tests/test_cli_first_run.py" not in run
+    assert "--ignore tests/test_cli_first_run.py" not in run
+    assert "TestEntryPointGuards" not in run
+    assert "TestInstalledEntryPointFirstRun" not in run
+    source_runs = "\n".join(step.get("run", "") for step in jobs["test"]["steps"])
+    assert "make test" in source_runs
+    assert "TestSourceEntryPointFirstRun" not in source_runs
