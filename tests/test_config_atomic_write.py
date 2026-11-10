@@ -3,6 +3,7 @@ import contextlib
 import ctypes
 import errno
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -509,57 +510,103 @@ class AtomicConfigWriteTest(unittest.TestCase):
         # Someone else's entry is not ours to delete.
         self.assertTrue(planted[0].is_symlink())
 
-    def final_link_fixture(self):
+    def shared_link_fixture(self, mode=0o777):
+        """A config symlink in a directory other users can change.
+
+        Its intended and unexpected targets are in the private home.
+        """
         intended = self.home / 'intended'
         intended.write_text('[DEFAULT]\nclient_id = old\n')
         unexpected = self.home / 'unexpected'
         unexpected.write_text('[DEFAULT]\nclient_id = untouched\n')
-        self.path.symlink_to(intended)
-        return intended, unexpected
+        for target in (intended, unexpected):
+            os.chmod(target, 0o600)
+        shared = self.home / 'shared'
+        shared.mkdir()
+        os.chmod(shared, mode)
+        link = shared / 'config'
+        link.symlink_to(intended)
+        return shared, link, intended, unexpected
 
-    @unittest.skipUnless(POSIX, 'POSIX symlinks')
-    def test_final_symlink_replaced_after_check_is_refused(self):
-        intended, unexpected = self.final_link_fixture()
-        real_readlink = os.readlink
-        swapped = []
-
-        def swap_link(path, *args, **kwargs):
-            if not swapped:
-                self.path.unlink()
-                self.path.symlink_to(unexpected)
-                swapped.append(True)
-            return real_readlink(path, *args, **kwargs)
-
-        with patch('gimme_aws_creds.config.os.readlink', side_effect=swap_link):
-            with self.assertRaisesRegex(GimmeAWSCredsError, 'Refusing to follow.*changed'):
-                self.write('new')
+    def assert_link_refused_unread(self, link, intended, unexpected, schedule):
+        """The write is refused before the link is read; nothing changes."""
+        with patch('gimme_aws_creds.config.os.readlink', side_effect=schedule) as readlink:
+            with self.assertRaisesRegex(
+                    GimmeAWSCredsError,
+                    'Refusing to follow configuration symlink .*: the directory .*shared '
+                    'that contains it is writable by other users'):
+                self.write('new', path=link)
+        readlink.assert_not_called()
+        self.assertEqual(os.readlink(link), str(intended))
         self.assertIn('old', intended.read_text())
         self.assertIn('untouched', unexpected.read_text())
         self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.leftovers(link.parent), [])
 
-    @unittest.skipUnless(POSIX, 'POSIX symlinks')
-    def test_final_symlink_swapped_out_and_back_is_refused(self):
-        # The checked link is moved aside during readlink and then restored.
-        intended, unexpected = self.final_link_fixture()
-        aside = self.home / 'aside'
+    @unittest.skipUnless(POSIX and not IS_ROOT, 'POSIX symlinks as non-root')
+    def test_link_in_shared_directory_is_refused_before_it_can_be_replaced(self):
+        for mode in (0o777, 0o1777, 0o770, 0o722):
+            with self.subTest(mode=oct(mode)):
+                shared, link, intended, unexpected = self.shared_link_fixture(mode)
+                real_readlink = os.readlink
+
+                def replace_link(path, *args, **kwargs):
+                    link.unlink()
+                    link.symlink_to(unexpected)
+                    return real_readlink(path, *args, **kwargs)
+
+                self.assert_link_refused_unread(link, intended, unexpected, replace_link)
+                os.chmod(shared, 0o700)
+                shutil.rmtree(shared)
+                (self.home / 'intended').unlink()
+                (self.home / 'unexpected').unlink()
+
+    @unittest.skipUnless(POSIX and not IS_ROOT, 'POSIX symlinks as non-root')
+    def test_link_swapped_out_and_back_in_shared_directory_is_refused(self):
+        # Moving the checked link aside during readlink and restoring it can
+        # leave its inode and ctime unchanged (seen on Linux tmpfs), so the
+        # directory itself must rule the swap out before the link is read.
+        shared, link, intended, unexpected = self.shared_link_fixture()
+        aside = shared / 'aside'
         real_readlink = os.readlink
-        swapped = []
 
         def swap_and_restore(path, *args, **kwargs):
-            if swapped:
-                return real_readlink(path, *args, **kwargs)
-            swapped.append(True)
-            os.rename(self.path, aside)
-            self.path.symlink_to(unexpected)
+            os.rename(link, aside)
+            link.symlink_to(unexpected)
             try:
                 return real_readlink(path, *args, **kwargs)
             finally:
-                os.replace(aside, self.path)
+                os.replace(aside, link)
 
-        with patch('gimme_aws_creds.config.os.readlink', side_effect=swap_and_restore):
-            with self.assertRaisesRegex(GimmeAWSCredsError, 'Refusing to follow.*changed'):
+        self.assert_link_refused_unread(link, intended, unexpected, swap_and_restore)
+
+    @unittest.skipUnless(POSIX and not IS_ROOT, 'POSIX symlinks as non-root')
+    def test_chain_through_link_in_shared_directory_is_refused_at_that_link(self):
+        # The first link is in the private home; the second is not.
+        shared, middle, intended, unexpected = self.shared_link_fixture()
+        self.path.symlink_to(middle)
+        real_readlink = os.readlink
+        read = []
+
+        def record(path, *args, **kwargs):
+            read.append(path)
+            return real_readlink(path, *args, **kwargs)
+
+        with patch('gimme_aws_creds.config.os.readlink', side_effect=record):
+            with self.assertRaisesRegex(
+                    GimmeAWSCredsError, 'the directory .*shared that contains it is writable'):
                 self.write('new')
+        self.assertEqual(read, [self.path.name])
         self.assertIn('old', intended.read_text())
+        self.assertIn('untouched', unexpected.read_text())
+        self.assertEqual(os.readlink(middle), str(intended))
+
+    @unittest.skipUnless(POSIX, 'POSIX symlinks')
+    def test_link_in_read_only_shared_directory_is_followed(self):
+        shared, link, intended, unexpected = self.shared_link_fixture(0o755)
+        self.write('new', path=link)
+        self.assertTrue(link.is_symlink())
+        self.assertIn('new', intended.read_text())
         self.assertIn('untouched', unexpected.read_text())
 
     @unittest.skipUnless(POSIX, 'POSIX symlinks')
@@ -1222,6 +1269,25 @@ class DestinationDirectoryTrustTest(unittest.TestCase):
                     path, 'its directory .* access control list that may let other users')
                 self.assertEqual(self.snapshot(home, unrelated), before)
                 self.assertIn('everyone', before['home_acl'])
+
+    @unittest.skipUnless(DARWIN, 'macOS extended ACLs')
+    def test_link_in_directory_whose_acl_lets_others_change_entries_is_not_read(self):
+        target_home, target, _ = self.directory('link-target')
+        for name, text in UNTRUSTED_DIRECTORY_ACLS.items():
+            with self.subTest(acl=name):
+                home, _, unrelated = self.directory('link-acl-' + name, acl=text)
+                link = home / 'link'
+                link.symlink_to(target)
+                before = self.snapshot(home, unrelated)
+                config = self.config_for(link)
+                with patch('gimme_aws_creds.config.os.readlink') as readlink:
+                    with self.assertRaisesRegex(
+                            GimmeAWSCredsError, 'Refusing to follow configuration symlink .*: '
+                            'the directory .* access control list that may let other users'):
+                        self.write(link, config=config)
+                readlink.assert_not_called()
+                self.assertEqual(self.snapshot(home, unrelated), before)
+                self.assertEqual(target.read_text(), ORIGINAL)
 
     @unittest.skipUnless(DARWIN, 'macOS extended ACLs')
     def test_directory_acl_without_those_rights_is_accepted_and_left_alone(self):

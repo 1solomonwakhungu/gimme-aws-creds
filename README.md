@@ -311,6 +311,8 @@ On Linux and macOS the directory that holds the configuration file must be owned
 other write permission (sticky or not) and no ACL entry granting those rights. Writes to
 a shared or world-writable directory are refused without changing anything; move the
 file (or point `OKTA_CONFIG`) to a private directory, or run `chmod go-w` on it.
+If the configuration path is a symlink, every directory that holds a link along the
+way must meet the same requirement, or the link is refused without being followed.
 Existing files are never automatically moved or merged. AWS/Alibaba credential files,
 keyrings and registered authenticator files keep their existing locations.
 

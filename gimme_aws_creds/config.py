@@ -674,9 +674,14 @@ class Config:
           (only root may give a file away, and only a member may assign a
           group), the write is refused rather than changing ownership.
         * If the path is a symlink, the regular file it points to is replaced,
-          provided every link followed is owned by the current user or root.
-          Dangling links, links owned by other users and links to anything
-          other than a regular file are refused. A symlink to a directory
+          provided every link followed is owned by the current user or root
+          and is in a directory that is trusted in the same way as the
+          destination directory (see below). That is checked through the
+          directory's pinned descriptor before the link is read, so no other
+          user can swap the link for another while it is read; links in any
+          other directory, such as a shared or sticky one, are refused
+          without being read. Dangling links, links owned by other users and
+          links to anything other than a regular file are refused. A symlink to a directory
           earlier in the path, followed by '..', resolves as the kernel does;
           the path is never normalized lexically.
 
@@ -731,9 +736,8 @@ class Config:
         Not covered: processes running as the same user or as root, which can
         change anything this process can; network filesystems whose server
         grants access the local modes and ACLs do not show; and filesystems
-        that do not enforce POSIX ownership and modes. A link is refused if it
-        changes while it is read. Another user who can write to a directory
-        earlier in the path can still change what the path resolves to
+        that do not enforce POSIX ownership and modes. Another user who can
+        write to a directory earlier in the path can still change what the path resolves to
         before it is opened, so success means the new file was published
         where the path pointed when it was resolved. The
         write fails, after publishing, if the published file or a pinned
@@ -824,13 +828,18 @@ class Config:
                     'Refusing to replace configuration file {}: not a regular file'.format(path))
             if followed >= self._MAX_CONFIG_SYMLINKS:
                 raise refuse_link(os.strerror(errno.ELOOP))
-            if posix and link.st_uid not in (os.geteuid(), 0):
-                raise refuse_link('owned by another user')
+            if posix:
+                if link.st_uid not in (os.geteuid(), 0):
+                    raise refuse_link('owned by another user')
+                # Only a directory whose entries no other user can change
+                # guarantees that the link read below is the one just
+                # checked: elsewhere it could be moved aside, replaced and
+                # restored with nothing in its metadata to show it.
+                problem = self._directory_trust_problem(directory[1])
+                if problem:
+                    raise refuse_link('the directory {} that contains it {}'.format(
+                        directory[0], problem))
             target = os.readlink(entry, dir_fd=dir_fd)
-            # A link's text cannot change in place; if the entry is still the
-            # same checked link (renaming it updates ctime), the text is its own.
-            if self._link_identity(os.lstat(entry, dir_fd=dir_fd)) != self._link_identity(link):
-                raise refuse_link('it changed while being read')
             followed += 1
 
             target_directory, name = os.path.split(target)
@@ -843,10 +852,6 @@ class Config:
                         display, target_directory, directory[1], pinned, opened)
                 except OSError as exc:
                     raise refuse_link(exc.strerror) from exc
-
-    @staticmethod
-    def _link_identity(st):
-        return st.st_dev, st.st_ino, st.st_uid, st.st_ctime_ns, st.st_mode
 
     # Name of the file inside the private staging directory. It is fixed:
     # nobody else can create entries there.
@@ -964,17 +969,22 @@ class Config:
         Nothing is created or changed before this check passes.
         """
         directory_path, fd = directory
-
-        def refuse(reason):
-            return errors.GimmeAWSCredsError(
+        problem = self._directory_trust_problem(fd)
+        if problem:
+            raise errors.GimmeAWSCredsError(
                 'Refusing to write configuration file {}: its directory {} {}'.format(
-                    path, directory_path, reason))
+                    path, directory_path, problem))
 
+    def _directory_trust_problem(self, fd):
+        """Say why users other than this one and root may change entries of ``fd``.
+
+        Returns None for a trusted directory. The directory is only read.
+        """
         st = os.fstat(fd)
         if st.st_uid not in (os.geteuid(), 0):
-            raise refuse('is owned by another user')
+            return 'is owned by another user'
         if stat.S_IMODE(st.st_mode) & 0o022:
-            raise refuse('is writable by other users (remove that with chmod go-w)')
+            return 'is writable by other users (remove that with chmod go-w)'
         try:
             if _ACL_POLICY == 'darwin':
                 shared = _darwin_acl_api().may_change_entries(fd)
@@ -984,11 +994,10 @@ class Config:
                 # are not limited by the mode.
                 shared = self._has_nfs4_acl(fd)
         except OSError as exc:
-            raise refuse('has an access control list that cannot be checked ({})'.format(
-                exc.strerror)) from exc
+            return 'has an access control list that cannot be checked ({})'.format(exc.strerror)
         if shared:
-            raise refuse('has an access control list that may let other users add or '
-                          'remove entries')
+            return 'has an access control list that may let other users add or remove entries'
+        return None
 
     def _require_acl_support(self, path):
         """Refuse platforms where ACLs on the staging directory cannot be ruled out."""
