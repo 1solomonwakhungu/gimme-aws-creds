@@ -1,0 +1,7 @@
+# Tools used by the release readiness checks and their tests.
+pytest
+PyYAML
+packaging
+# The loopback Content-Encoding check is exercised against this HTTP stack in its own tests.
+requests
+urllib3>=2.6.3
