@@ -115,9 +115,17 @@ class Config:
         # as open() will when writing the original configuration path.
         parent = os.path.dirname(path) or os.curdir
         missing = []
-        while not os.path.exists(parent):
-            missing.append(parent)
-            parent = os.path.dirname(parent) or os.curdir
+        while True:
+            try:
+                os.stat(parent)
+            except FileNotFoundError:
+                ancestor = os.path.dirname(parent) or os.curdir
+                if ancestor == parent:
+                    raise
+                missing.append(parent)
+                parent = ancestor
+            else:
+                break
         for directory in reversed(missing):
             try:
                 os.mkdir(directory, mode=0o700)

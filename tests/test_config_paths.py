@@ -1,4 +1,5 @@
 """Configuration discovery and first-write directory behavior."""
+import ntpath
 import os
 from pathlib import Path
 import stat
@@ -179,3 +180,46 @@ class TestConfigPaths(unittest.TestCase):
             self.assertTrue((self.home / 'nested' / 'config').is_file())
         finally:
             os.chdir(previous)
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0,
+                     'requires POSIX search permissions without root privileges')
+    def test_unsearchable_current_directory_reports_permission_error(self):
+        config = self.config({'OKTA_CONFIG': 'nested/config'})
+        previous = os.getcwd()
+        exists = os.path.exists
+        calls = []
+
+        def bounded_exists(path):
+            calls.append(path)
+            if len(calls) > 8:
+                raise AssertionError('parent traversal did not terminate')
+            return exists(path)
+
+        try:
+            os.chdir(self.home)
+            self.home.chmod(0)
+            with patch('gimme_aws_creds.config.os.path.exists', side_effect=bounded_exists):
+                with self.assertRaisesRegex(GimmeAWSCredsError, 'Cannot write configuration file.*Permission denied'):
+                    config.write_config_file({'client_id': 'synthetic'})
+        finally:
+            self.home.chmod(0o700)
+            os.chdir(previous)
+        self.assertFalse((self.home / 'nested').exists())
+
+    def test_unavailable_windows_roots_report_missing_path(self):
+        for path in ('Z:\\nested\\config', '\\\\unreachable\\share\\nested\\config'):
+            with self.subTest(path=path):
+                calls = []
+
+                def missing_stat(parent):
+                    calls.append(parent)
+                    if len(calls) > 8:
+                        raise AssertionError('parent traversal did not terminate')
+                    raise FileNotFoundError(2, 'No such file or directory', parent)
+
+                with patch('gimme_aws_creds.config.os.path', ntpath), \
+                     patch('gimme_aws_creds.config.os.stat', side_effect=missing_stat), \
+                     patch('gimme_aws_creds.config.os.mkdir') as mkdir:
+                    with self.assertRaises(FileNotFoundError):
+                        Config._create_config_parent(path)
+                mkdir.assert_not_called()
