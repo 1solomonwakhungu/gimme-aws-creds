@@ -31,6 +31,8 @@ Manages all configuration sources:
 - Profile inheritance via the `inherits = parent_profile` key
 - Per-value source tracking (CLI / env / profile / inherited / default) consumed by `--debug` output
 
+When the configuration file does not exist, `Config` validates the command line before it starts the first-time configuration wizard, so `--help`, `--version` and invalid arguments exit without prompting or writing files. `get_args()` applies the parsed values afterwards.
+
 **Key Configuration Options:**
 - `okta_org_url` - Okta organization URL
 - `gimme_creds_server` - Credential server mode (`internal` / `appurl` / a gimme-creds-lambda URL)
