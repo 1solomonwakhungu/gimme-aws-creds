@@ -117,6 +117,10 @@ class IsolatedEntryPointMixin:
             'TEMP': str(self.root / 'tmp'),
             'TMP': str(self.root / 'tmp'),
             'PYTHON_KEYRING_BACKEND': 'keyring.backends.null.Keyring',
+            # PyCryptodome's optional GMP discovery invokes ldconfig on Linux.
+            # These CLI checks do not exercise RSA arithmetic; keep process
+            # launches forbidden by using its bundled arithmetic backend.
+            'PYCRYPTODOME_DISABLE_GMP': '1',
         }
         for name in ('PATH', 'SYSTEMROOT'):
             if name in os.environ:
@@ -154,6 +158,7 @@ class TestEntryPointGuards(IsolatedEntryPointMixin, unittest.TestCase):
         ('credential backend', 'import keyring\nkeyring.get_password("gimme-aws-creds", "probe")\n'),
         ('file write', 'open("probe-output.txt", "w").close()\n'),
         ('null-named regular file', 'open("null", "w").close()\n'),
+        ('subprocess', 'import subprocess, sys\nsubprocess.run([sys.executable, "-c", "pass"])\n'),
     )
 
     def test_null_device_writes_are_allowed(self):
