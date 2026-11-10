@@ -5,17 +5,20 @@ would see (stdout and stderr) and every log record emitted, then assert that
 no marker, and no 8-character piece of a marker, survives. They also assert
 that safe diagnostics (method, path, status, timing, request ID) remain.
 
-All HTTP traffic is served by an in-process adapter; nothing leaves the host.
+All HTTP traffic is served by an in-process adapter or a mocked urllib3
+connection; nothing leaves the host.
 """
+import ast
 import io
 import json
 import logging
 import os
-import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
 from datetime import timedelta
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import requests
 from requests.adapters import BaseAdapter
@@ -25,7 +28,7 @@ from gimme_aws_creds.common import create_http_session
 from gimme_aws_creds.debug_formatter import (
     DebugFormatter,
     _mask_config_value,
-    _redact_sensitive_debug_text,
+    _sanitize_url,
     format_resolved_configuration,
     setup_debug_logging,
 )
@@ -35,6 +38,8 @@ from gimme_aws_creds.okta_identity_engine import OktaIdentityEngine
 from tests.user_interface_mock import MockUserInterface
 
 ORG = 'https://example.okta.test'
+CLIENT_ID = '0oa1b2c3d4E5F6g7H8i9'
+REQUEST_ID = 'YJ3xqfJ0eXk0b7Ehq7sBjgAAB4o'
 
 # Unique synthetic secrets. None share an 8-character window with each other
 # or with ordinary debug output.
@@ -60,10 +65,13 @@ SET_COOKIE = 'scV3hK8tBq1YmP5G'
 OKTA_SESSION_HEADER = 'ohN6rC2xDw9LfT4E'
 SAML_VALUE = 'smQ4yJ7pKz1HcV8R'
 VERIFY_URI_CODE = 'vuE2bN5mXt9GqL3W'
+ECHO = 'ecR7tN2wQk5ZpL8M'
+ECHO_ID = 'erT4mW8qZk2NpB6VxC3dLf9Hs1J'
 
 SECRETS = {
     name: value for name, value in globals().items()
-    if name.isupper() and isinstance(value, str) and name not in ('ORG',)
+    if name.isupper() and isinstance(value, str)
+    and name not in ('ORG', 'CLIENT_ID', 'REQUEST_ID')
 }
 
 
@@ -93,6 +101,7 @@ def _response(request, status=200, body=b'', headers=None, reason='OK'):
     response._content = body if isinstance(body, bytes) else body.encode()
     response.request = request
     response.url = request.url
+    response.elapsed = timedelta(milliseconds=125)
     return response
 
 
@@ -110,7 +119,8 @@ class FakeAdapter(BaseAdapter):
         status, body, headers = self.routes[(request.method, path)]
         if callable(body):
             body = body(request)
-        return _response(request, status, body, headers)
+        reason = 'OK' if status == 200 else requests.status_codes._codes[status][0].replace('_', ' ').title()
+        return _response(request, status, body, headers, reason=reason)
 
     def close(self):
         pass
@@ -130,13 +140,20 @@ def debug_capture():
             text = record.getMessage()
             if record.exc_text:
                 text += '\n' + record.exc_text
+            if record.stack_info:
+                text += '\n' + record.stack_info
             records.append(text)
 
+    def output():
+        return '\n'.join([stdout.getvalue(), stderr.getvalue()] + records)
+
+    output.stderr = stderr
+    output.records = records
     try:
         with patch('sys.stderr', stderr), redirect_stdout(stdout):
             setup_debug_logging()
             root.addHandler(Capture(level=logging.DEBUG))
-            yield lambda: '\n'.join([stdout.getvalue(), stderr.getvalue()] + records)
+            yield output
     finally:
         for handler in root.handlers[:]:
             root.removeHandler(handler)
@@ -145,6 +162,13 @@ def debug_capture():
         root.setLevel(saved[1])
         gac.setLevel(saved[2])
         logging.setLogRecordFactory(saved[3])
+
+
+def _serve(routes, method, url, **kwargs):
+    """Send one request through a debug session, so the real hook logs it."""
+    session = create_http_session(debug=True)
+    session.mount('https://', FakeAdapter(routes))
+    return session.request(method, url, **kwargs)
 
 
 class TestAuditReproductions(LeakAssertions, unittest.TestCase):
@@ -168,16 +192,17 @@ class TestAuditReproductions(LeakAssertions, unittest.TestCase):
         out = DebugFormatter.format_request(self._prepared(
             'GET', ORG + f'/home/amazon_aws/app/1?sessionToken={SESSION_TOKEN}'))
         self.assertNoSecrets(out)
-        self.assertIn('/home/amazon_aws/app/1?sessionToken=[REDACTED]', out)
+        self.assertIn('/home/amazon_aws/app/[id]?sessionToken=[REDACTED]', out)
 
     def test_device_poll_request(self):
         out = DebugFormatter.format_request(self._prepared(
             'POST', ORG + '/oauth2/v1/token',
-            data={'client_id': 'synthetic-client', 'device_code': DEVICE_CODE,
+            data={'client_id': CLIENT_ID, 'device_code': DEVICE_CODE,
                   'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'},
         ))
         self.assertNoSecrets(out)
-        self.assertIn('client_id=synthetic-client', out)
+        self.assertIn(f'client_id={CLIENT_ID}', out)
+        self.assertIn('device_code=[REDACTED]', out)
         self.assertIn('grant_type=urn%3Aietf', out)
 
     def test_device_authorization_response(self):
@@ -207,33 +232,158 @@ class TestAuditReproductions(LeakAssertions, unittest.TestCase):
             _profile_value_sources = {}
 
         out = format_resolved_configuration(
-            Config(), {'okta_mfa_code': MFA_ENV, 'client_id': 'visible-client'},
+            Config(), {'okta_mfa_code': MFA_ENV, 'client_id': CLIENT_ID},
             env_overrides_applied={'okta_mfa_code': 'OKTA_MFA_CODE'},
         )
         self.assertNoSecrets(out)
         self.assertIn('--mfa-code = [REDACTED]', out)
-        self.assertIn('visible-client', out)
+        self.assertIn(CLIENT_ID, out)
+
+
+class TestTypedResponseFields(LeakAssertions, unittest.TestCase):
+    """Known field names do not make arbitrary values displayable."""
+
+    MALICIOUS_BODIES = [
+        {'status': ECHO},
+        {'factorResult': ECHO},
+        {'factorType': ECHO},
+        {'provider': ECHO},
+        {'expires_in': ECHO},
+        {'interval': ECHO},
+        {'scope': ECHO},
+        {'scope': f'openid {ECHO}'},
+        {'client_id': ECHO},
+        {'token_type': ECHO},
+        {'error': ECHO},
+        {'errorCode': ECHO},
+        {'expiresAt': ECHO},
+        {'message': ECHO},
+        {'message': [ECHO]},
+        {'error_description': f'password: {ECHO}'},
+        {'error_description': f'password:{ECHO}'},
+        {'error_description': ECHO},
+        {'errorSummary': f'The password {ECHO} is invalid'},
+        {'errorCauses': [{'errorSummary': ECHO}]},
+        {'opaque': {'status': ECHO}},
+        {'opaque': [{'status': ECHO}]},
+        {'_embedded': {'factors': [{'factorType': ECHO, 'opaque': ECHO}]}},
+        {'_embedded': {'user': {'profile': {'login': ECHO}}}},
+        {'status': {'nested': ECHO}},
+        {ECHO: 'SUCCESS'},
+    ]
+
+    def test_malicious_values_through_hook_factory_console_and_records(self):
+        for body in self.MALICIOUS_BODIES:
+            with self.subTest(body=json.dumps(body)[:60]):
+                routes = {('GET', '/api/v1/authn'): (
+                    400, json.dumps(body), {'Content-Type': 'application/json'})}
+                with debug_capture() as output:
+                    _serve(routes, 'GET', ORG + '/api/v1/authn')
+                text = output()
+                self.assertNoSecrets(text)
+                self.assertIn('GET https://example.okta.test/api/v1/authn', text)
+                self.assertIn('400 Bad Request', text)
+
+    def test_valid_typed_values_are_shown(self):
+        body = {
+            'status': 'MFA_REQUIRED', 'expiresAt': '2026-11-09T20:00:00.000Z',
+            'factorResult': 'WAITING', 'errorCode': 'E0000004',
+            'error': 'authorization_pending', 'expires_in': 300,
+            'scope': 'openid okta.apps.sso', 'token_type': 'Bearer',
+            '_embedded': {'factors': [{'factorType': 'push', 'provider': 'OKTA',
+                                       'id': 'opf1b2c3d4E5F6g7H8i9'}]},
+        }
+        out = DebugFormatter._format_body(json.dumps(body))
+        for expected in ('"status": "MFA_REQUIRED"', '"factorResult": "WAITING"',
+                         '"errorCode": "E0000004"', '"error": "authorization_pending"',
+                         '"expires_in": 300', '"scope": "openid okta.apps.sso"',
+                         '"token_type": "Bearer"', '"factorType": "push"',
+                         '"provider": "OKTA"', '"expiresAt": "2026-11-09T20:00:00.000Z"',
+                         '"id": "[REDACTED]"'):
+            self.assertIn(expected, out)
+
+    def test_unknown_fields_are_counted_not_named(self):
+        out = DebugFormatter._format_body(json.dumps({ECHO: 1, 'opaque': {'x': 2}, 'status': 'SUCCESS'}))
+        self.assertNoSecrets(out)
+        self.assertNotIn('opaque', out)
+        self.assertIn('"[omitted]": "2 unrecognized fields"', out)
+
+    def test_form_and_query_values_are_typed(self):
+        body = f'message={ECHO}&status={ECHO}&grant_type={ECHO}&opaque={ECHO}&{ECHO}=1'
+        out = DebugFormatter._format_body(body, 'application/x-www-form-urlencoded')
+        self.assertNoSecrets(out)
+        self.assertIn('status=[REDACTED]', out)
+        self.assertIn('[2 unrecognized parameters omitted]', out)
+        url = _sanitize_url(ORG + f'/api?status={ECHO}&rememberDevice=true&opaque={ECHO}')
+        self.assertNoSecrets(url)
+        self.assertEqual(
+            url, 'https://example.okta.test/api?status=[REDACTED]&rememberDevice=true'
+                 '&[1 unrecognized parameter omitted]')
+
+
+class TestUrlPaths(LeakAssertions, unittest.TestCase):
+
+    def test_unknown_path_segments_of_any_length_are_omitted(self):
+        for segment in (ECHO, ECHO[:8], ECHO * 3, ACCESS_TOKEN, f'{ECHO};jsessionid={COOKIE_SID}',
+                        requests.utils.quote(f'x?sessionToken={SESSION_TOKEN}', safe='')):
+            with self.subTest(segment=segment[:20]):
+                url = _sanitize_url(ORG + f'/activate/{segment}/verify')
+                self.assertNoSecrets(url)
+                self.assertEqual(url, 'https://example.okta.test/activate/[id]/verify')
+
+    def test_known_routes_keep_their_shape(self):
+        self.assertEqual(
+            _sanitize_url(ORG + '/api/v1/authn/factors/opf1b2c3d4E5F6g7H8i9/verify'),
+            'https://example.okta.test/api/v1/authn/factors/[id]/verify')
+        self.assertEqual(_sanitize_url(ORG + '/oauth2/v1/device/authorize'),
+                         'https://example.okta.test/oauth2/v1/device/authorize')
+
+    def test_userinfo_fragment_and_redirects(self):
+        nested = requests.utils.quote(f'/app?sessionToken={SESSION_TOKEN}', safe='')
+        url = _sanitize_url(f'https://user:{PASSWORD}@example.okta.test/login/x'
+                            f'?fromURI={requests.utils.quote(nested, safe="")}#id_token={ID_TOKEN}')
+        self.assertNoSecrets(url)
+        self.assertEqual(url, 'https://[REDACTED]@example.okta.test/login/[id]?fromURI=[REDACTED]#[REDACTED]')
+
+    def test_query_case_and_encoding_variants(self):
+        nested = requests.utils.quote(f'/app?sessionToken={SESSION_TOKEN}', safe='')
+        double = requests.utils.quote(nested, safe='')
+        for query in (
+            f'SESSIONTOKEN={SESSION_TOKEN}',
+            f'session%54oken={SESSION_TOKEN}',
+            f'x=1;sessionToken={SESSION_TOKEN}',
+            f'fromURI={nested}',
+            f'fromURI={double}',
+            f'redirect_uri=https%3A%2F%2Fu%3A{PASSWORD}%40h.test%2Fcb%3Fcode%3D{USER_CODE}',
+        ):
+            with self.subTest(query=query):
+                out = DebugFormatter.format_request(
+                    requests.Request('GET', ORG + '/login/x?' + query).prepare())
+                self.assertNoSecrets(out)
+                self.assertIn('GET https://example.okta.test/login/[id]?', out)
 
 
 class TestHeaderRedaction(LeakAssertions, unittest.TestCase):
 
-    def test_credential_headers_fully_redacted_in_any_case(self):
+    def test_credential_and_unknown_headers_hidden_in_any_case(self):
         headers = {
             'Authorization': f'Bearer {AUTH_BEARER}',
             'authorization': f'SSWS {AUTH_SSWS}',
             'COOKIE': f'sid={COOKIE_SID}; DT={COOKIE_DT}',
             'X-Okta-Session-Id': OKTA_SESSION_HEADER,
+            'Server': ECHO,
             'x-custom-unknown': NESTED,
-            'Content-Type': 'application/json',
-            'X-Okta-Request-Id': 'req-abc123',
+            'Content-Type': 'application/json; charset=utf-8',
+            'X-Okta-Request-Id': REQUEST_ID,
         }
         out = DebugFormatter._mask_sensitive_headers(headers)
         self.assertNoSecrets(json.dumps(out))
-        for name in ('Authorization', 'authorization', 'COOKIE',
-                     'X-Okta-Session-Id', 'x-custom-unknown'):
+        for name in ('Authorization', 'authorization', 'COOKIE', 'X-Okta-Session-Id', 'Server'):
             self.assertEqual(out[name], '[REDACTED]')
+        self.assertNotIn('x-custom-unknown', out)
+        self.assertEqual(out['[omitted]'], '1 unrecognized header')
         self.assertEqual(out['Content-Type'], 'application/json')
-        self.assertEqual(out['X-Okta-Request-Id'], 'req-abc123')
+        self.assertEqual(out['X-Okta-Request-Id'], REQUEST_ID)
 
     def test_short_and_long_values_both_fully_redacted(self):
         for value in ('Bearer x', 'Bearer ' + AUTH_BEARER * 4):
@@ -253,10 +403,26 @@ class TestHeaderRedaction(LeakAssertions, unittest.TestCase):
             'https://example.okta.test/app/sso?SessionToken=[REDACTED]#[REDACTED]',
         )
 
+    def test_request_id_policy(self):
+        """Request IDs: fixed server format only, and never an echo of sent text."""
+        self.assertEqual(DebugFormatter._mask_sensitive_headers({'X-Okta-Request-Id': ECHO}),
+                         {'X-Okta-Request-Id': '[REDACTED]'})
+        uuid = '0f8fad5b-d9cb-469f-a165-70867728950e'
+        self.assertEqual(DebugFormatter._mask_sensitive_headers({'x-amzn-RequestId': uuid}),
+                         {'x-amzn-RequestId': uuid})
+        routes = {('POST', '/api/v1/authn'): (
+            200, '{"status": "SUCCESS"}',
+            {'Content-Type': 'application/json', 'X-Okta-Request-Id': ECHO_ID})}
+        with debug_capture() as output:
+            _serve(routes, 'POST', ORG + '/api/v1/authn', json={'password': ECHO_ID})
+        text = output()
+        self.assertNoSecrets(text)
+        self.assertIn('X-Okta-Request-Id: [REDACTED]', text)
+
 
 class TestStructuredBodies(LeakAssertions, unittest.TestCase):
 
-    def test_nested_json_values_redacted_unless_allowlisted(self):
+    def test_nested_json_values_redacted_unless_typed(self):
         body = json.dumps({
             'stateToken': STATE_TOKEN,
             'passCode': PASSCODE,
@@ -271,9 +437,10 @@ class TestStructuredBodies(LeakAssertions, unittest.TestCase):
         self.assertNoSecrets(out)
         self.assertIn('"factorType": "token:software:totp"', out)
         self.assertIn('"status": "MFA_REQUIRED"', out)
-        self.assertIn('"number": "[REDACTED]"', out)
+        self.assertIn('"passCode": "[REDACTED]"', out)
+        self.assertNotIn('123456', out)
 
-    def test_allowlisted_field_holding_secret_assignment_is_redacted(self):
+    def test_free_text_fields_are_never_shown(self):
         out = DebugFormatter._mask_sensitive_dict({
             'name': f'password={PASSWORD}',
             'errorSummary': f'see /x?sessionToken={SESSION_TOKEN}',
@@ -281,7 +448,7 @@ class TestStructuredBodies(LeakAssertions, unittest.TestCase):
             'label': 'Okta Verify',
         })
         self.assertNoSecrets(json.dumps(out))
-        self.assertEqual(out['label'], 'Okta Verify')
+        self.assertEqual(set(out.values()), {'[REDACTED]'})
 
     def test_escaped_json_key_variant_redacted(self):
         body = '{"session\\u0054oken": "%s", "SESSIONTOKEN": "%s"}' % (SESSION_TOKEN, SESSION_TOKEN)
@@ -292,29 +459,6 @@ class TestStructuredBodies(LeakAssertions, unittest.TestCase):
                 f'&mfa_code={MFA_CLI}&Session-Token={SESSION_TOKEN}')
         out = DebugFormatter._format_body(body)
         self.assertNoSecrets(out)
-
-    def test_query_case_and_encoding_variants(self):
-        nested = requests.utils.quote(f'/app?sessionToken={SESSION_TOKEN}', safe='')
-        double = requests.utils.quote(nested, safe='')
-        for query in (
-            f'SESSIONTOKEN={SESSION_TOKEN}',
-            f'session%54oken={SESSION_TOKEN}',
-            f'x=1;sessionToken={SESSION_TOKEN}',
-            f'fromURI={nested}',
-            f'fromURI={double}',
-            f'redirect_uri=https%3A%2F%2Fu%3A{PASSWORD}%40h.test%2Fcb%3Fcode%3D{USER_CODE}',
-        ):
-            with self.subTest(query=query):
-                out = DebugFormatter.format_request(
-                    requests.Request('GET', ORG + '/login/x?' + query).prepare())
-                self.assertNoSecrets(out)
-                self.assertIn('GET https://example.okta.test/login/x?', out)
-
-    def test_url_userinfo_and_secret_path_segment_redacted(self):
-        url = f'https://user:{PASSWORD}@example.okta.test/a/{ACCESS_TOKEN}/b;jsessionid={COOKIE_SID}'
-        out = DebugFormatter.format_request(requests.Request('GET', url).prepare())
-        self.assertNoSecrets(out)
-        self.assertIn('https://[REDACTED]@example.okta.test/a/[REDACTED]/b;[REDACTED]', out)
 
     def test_unparsed_bodies_are_summarized_not_printed(self):
         html = (f'<form><input type="hidden" name="SAMLResponse" value="{SAML_VALUE}"/>'
@@ -327,45 +471,39 @@ class TestStructuredBodies(LeakAssertions, unittest.TestCase):
         self.assertEqual(DebugFormatter._format_body(b'\xff\xfe' + PASSWORD.encode()),
                          '[body omitted: 18 bytes]')
 
+    def test_nonstandard_reason_phrase_is_omitted(self):
+        request = requests.Request('GET', ORG + '/api/v1/authn').prepare()
+        out = DebugFormatter.format_response(_response(request, 401, '{}', reason=f'pw {ECHO}'))
+        self.assertNoSecrets(out)
+        self.assertIn('401 [reason omitted]', out)
 
-class TestConfigValues(unittest.TestCase):
+
+class TestConfigValues(LeakAssertions, unittest.TestCase):
 
     def test_secret_and_unknown_keys_fully_redacted(self):
         for key in ('mfa_code', 'okta_mfa_code', 'OKTA_MFA_CODE', 'okta_password',
-                    'OKTA_PASSWORD', 'device_token', 'api_key', 'some_new_key'):
+                    'OKTA_PASSWORD', 'device_token', 'api_key', 'some_new_key',
+                    'okta_username', 'aws_appname'):
             with self.subTest(key=key):
                 self.assertEqual(_mask_config_value(key, MFA_CLI), '[REDACTED]')
 
+    def test_known_keys_require_their_type(self):
+        for key in ('device_flow_scope', 'client_id', 'okta_auth_server', 'aws_region',
+                    'aws_rolename', 'okta_platform', 'preferred_mfa_type',
+                    'preferred_mfa_provider', 'output_format', 'aws_default_duration',
+                    'write_aws_creds', 'gimme_creds_server', 'duo_universal_factor'):
+            with self.subTest(key=key):
+                self.assertEqual(_mask_config_value(key, MFA_CLI + '!'), '[REDACTED]')
+        self.assertEqual(_mask_config_value('aws_rolename', 'arn:aws:iam::123456789012:role/Dev'),
+                         'arn:aws:iam::123456789012:role/Dev')
+        self.assertEqual(_mask_config_value('okta_platform', 'classic'), 'classic')
+        self.assertEqual(_mask_config_value('aws_default_duration', '3600'), '3600')
+
     def test_allowlisted_url_value_is_sanitized(self):
         self.assertEqual(
-            _mask_config_value('app_url', ORG + f'/home/app?sessionToken={SESSION_TOKEN}'),
-            'https://example.okta.test/home/app?sessionToken=[REDACTED]',
+            _mask_config_value('app_url', ORG + f'/home/amazon_aws/{ECHO}/272?sessionToken={SESSION_TOKEN}'),
+            'https://example.okta.test/home/amazon_aws/[id]/[id]?sessionToken=[REDACTED]',
         )
-
-
-class TestFreeText(LeakAssertions, unittest.TestCase):
-
-    def test_free_text_variants(self):
-        cases = [
-            f'"GET /home/amazon_aws/app/1?sessionToken={SESSION_TOKEN} HTTP/1.1" 200 None',
-            f'Authorization: Bearer {AUTH_BEARER}',
-            f'cookie: sid={COOKIE_SID}; DT={COOKIE_DT}',
-            f'Cookie:sid={COOKIE_SID}; DT={COOKIE_DT}',
-            f"{{'password': '{PASSWORD}', 'passCode': b'{PASSCODE}'}}",
-            f'"device_code":"{DEVICE_CODE}"',
-            f'mfa_code={MFA_CLI} user_code: {USER_CODE}',
-            f'<SessionToken>{SESSION_TOKEN}</SessionToken>',
-            f'<input value="{SAML_VALUE}" name="SAMLResponse">',
-            f'redirect to /x%3FsessionToken%3D{SESSION_TOKEN}',
-            f'token {ACCESS_TOKEN}',
-        ]
-        for text in cases:
-            with self.subTest(text=text[:30]):
-                self.assertNoSecrets(_redact_sensitive_debug_text(text))
-
-    def test_safe_text_untouched(self):
-        text = 'POST /api/v1/authn status=MFA_REQUIRED token_type=Bearer 200'
-        self.assertEqual(_redact_sensitive_debug_text(text), text)
 
 
 class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
@@ -379,6 +517,20 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
         session.mount('https://', adapter)
         return adapter
 
+    def test_known_safe_diagnostics_are_kept(self):
+        routes = {('POST', '/api/v1/authn'): (
+            200, json.dumps({'status': 'SUCCESS', 'expires_in': 300}),
+            {'Content-Type': 'application/json', 'X-Okta-Request-Id': REQUEST_ID})}
+        with debug_capture() as output:
+            _serve(routes, 'POST', ORG + '/api/v1/authn', json={'password': PASSWORD})
+        text = output()
+        self.assertNoSecrets(text)
+        self.assertRegex(output.stderr.getvalue(), rf'200 OK \(\d+ ms, request id {REQUEST_ID}\)')
+        for expected in ('POST https://example.okta.test/api/v1/authn',
+                         '"status": "SUCCESS"',
+                         '"expires_in": 300', '"password": "[REDACTED]"'):
+            self.assertIn(expected, output.stderr.getvalue())
+
     def test_oie_device_authorization_and_polling(self):
         token_body = json.dumps({
             'access_token': ACCESS_TOKEN, 'id_token': ID_TOKEN,
@@ -390,13 +542,13 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
                 'verification_uri': ORG + '/activate',
                 'verification_uri_complete': ORG + f'/activate?user_code={USER_CODE}',
                 'expires_in': 600, 'interval': 5,
-            }), {'Content-Type': 'application/json', 'X-Okta-Request-Id': 'oie-req-1'}),
+            }), {'Content-Type': 'application/json', 'X-Okta-Request-Id': REQUEST_ID}),
             ('POST', '/oauth2/v1/token'): (200, token_body,
                                            {'Content-Type': 'application/json',
                                             'Set-Cookie': f'sid={SET_COOKIE}; Path=/'}),
         }
         with debug_capture() as output:
-            client = OktaIdentityEngine(self.ui, ORG, 'synthetic-client', debug=True)
+            client = OktaIdentityEngine(self.ui, ORG, CLIENT_ID, debug=True)
             self._mount(client._http_client, routes)
             started = client._start_device_flow()
             tokens = client._get_user_tokens(started['apiResponse']['device_code'])
@@ -405,7 +557,7 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
         self.assertNoSecrets(text)
         self.assertIn('POST https://example.okta.test/oauth2/v1/device/authorize', text)
         self.assertIn('POST https://example.okta.test/oauth2/v1/token', text)
-        self.assertIn('request id oie-req-1', text)
+        self.assertIn(f'request id {REQUEST_ID}', text)
         self.assertRegex(text, r'200 OK \(\d+ ms')
         self.assertIn('Set-Cookie: [REDACTED]', text)
 
@@ -437,7 +589,8 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
         self.assertEqual(saml['SAMLResponse'], SAML_VALUE)
         text = output()
         self.assertNoSecrets(text)
-        self.assertIn('GET https://example.okta.test/home/amazon_aws/app/1?sessionToken=[REDACTED]', text)
+        self.assertIn('GET https://example.okta.test/home/amazon_aws/app/[id]?sessionToken=[REDACTED]', text)
+        self.assertIn('POST https://example.okta.test/api/v1/authn/factors/[id]/verify', text)
         self.assertIn('"errorCode": "E0000068"', text)
         self.assertIn('401', text)
 
@@ -467,39 +620,16 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
         ui = MockUserInterface(environ=environ,
                                argv=['gimme-aws-creds', '--profile', 'p', '--debug', '--mfa-code', MFA_CLI])
         with open(os.path.join(ui.HOME, '.okta_aws_login_config'), 'w') as f:
-            f.write(f'[p]\nokta_org_url = {ORG}\nclient_id = cfg-client\n'
-                    f'okta_mfa_code = {MFA_CONF}\n')
+            f.write(f'[p]\nokta_org_url = {ORG}\nclient_id = {CLIENT_ID}\n'
+                    f'okta_mfa_code = {MFA_CONF}\ndevice_flow_scope = openid {ECHO}\n')
         with debug_capture() as output:
             with patch.object(GimmeAWSCreds, 'get_resolver', return_value=None):
                 GimmeAWSCreds(ui=ui).generate_config()
         text = output()
         self.assertNoSecrets(text)
         self.assertIn('RESOLVED CONFIGURATION', text)
-        self.assertIn('cfg-client', text)
+        self.assertIn(CLIENT_ID, text)
         self.assertIn('--mfa-code = [REDACTED]', text)
-
-    def test_third_party_records_and_tracebacks_are_redacted(self):
-        with debug_capture() as output:
-            logging.getLogger('urllib3.connectionpool').debug(
-                '%s://%s:%s "%s %s %s" %s %s', 'https', 'example.okta.test', 443, 'GET',
-                f'/home/amazon_aws/app/1?sessionToken={SESSION_TOKEN}', 'HTTP/1.1', 200, None)
-            logging.getLogger('botocore.endpoint').debug(
-                'Making request with params: %s',
-                {'body': {'Action': 'AssumeRoleWithSAML', 'SAMLAssertion': SAML_VALUE},
-                 'headers': {'Authorization': f'Bearer {AUTH_BEARER}'}})
-            logging.getLogger('botocore.parsers').debug('Response body:\n%s',
-                                                         f'<x><SessionToken>{SESSION_TOKEN}</SessionToken></x>'.encode())
-            try:
-                raise requests.HTTPError(
-                    f'401 Client Error for url: {ORG}/app?sessionToken={SESSION_TOKEN}&otp={MFA_CLI}')
-            except requests.HTTPError:
-                logging.getLogger('gimme_aws_creds.test').exception('request failed')
-            logging.getLogger('some.lib').warning('cookie: sid=%s', COOKIE_SID)
-        text = output()
-        self.assertNoSecrets(text)
-        self.assertIn("'Action': 'AssumeRoleWithSAML'", text)
-        self.assertIn('GET /home/amazon_aws/app/1?sessionToken=[REDACTED]', text)
-        self.assertIn('HTTPError', text)
 
     def test_formatting_failure_never_falls_back_to_raw_output(self):
         session = create_http_session(debug=True)
@@ -510,6 +640,156 @@ class TestEndToEndDebugRuns(LeakAssertions, unittest.TestCase):
         text = output()
         self.assertNoSecrets(text)
         self.assertIn('[debug output unavailable: RuntimeError]', text)
+
+
+class TestDependencyRecords(LeakAssertions, unittest.TestCase):
+    """Library log records are rendered from a registry or omitted."""
+
+    def test_real_urllib3_make_request_with_mocked_connection(self):
+        from urllib3.connectionpool import HTTPConnectionPool
+
+        pool = HTTPConnectionPool('example.okta.test')
+        conn = Mock()
+        conn.is_closed = False
+        conn.getresponse.return_value = SimpleNamespace(
+            version_string='HTTP/1.1', status=200, length_remaining=0)
+        with debug_capture() as output:
+            pool._new_conn()
+            pool._make_request(conn, 'GET', f'/activate/{USER_CODE}?sessionToken={SESSION_TOKEN}')
+            pool._make_request(conn, 'GET', f'/activate/{ECHO * 3}')
+        text = output()
+        self.assertNoSecrets(text)
+        console = output.stderr.getvalue()
+        self.assertIn('Starting new HTTP connection (1): example.okta.test:80', console)
+        self.assertIn('http://example.okta.test "GET /activate/[id]?sessionToken=[REDACTED] HTTP/1.1" 200 0',
+                      console)
+        self.assertIn('"GET /activate/[id] HTTP/1.1" 200 0', console)
+        self.assertEqual(sum('"GET /activate/[id]' in r for r in output.records), 2)
+
+    def test_registered_template_with_hostile_arguments(self):
+        with debug_capture() as output:
+            logging.getLogger('urllib3.connectionpool').debug(
+                '%s://%s:%s "%s %s %s" %s %s', 'https', 'example.okta.test', 443, 'GET',
+                f'https://u:{PASSWORD}@example.okta.test/api?opaque={ECHO}', 'HTTP/1.1', 200, None)
+            logging.getLogger('urllib3.connectionpool').debug(
+                '%s://%s:%s "%s %s %s" %s %s', ECHO, f'{ECHO}.x', ECHO, ECHO, ECHO, ECHO, ECHO, ECHO)
+        text = output()
+        self.assertNoSecrets(text)
+        self.assertIn('https://[REDACTED]@example.okta.test/api?[1 unrecognized parameter omitted]', text)
+
+    def test_unregistered_records_are_omitted_at_every_level(self):
+        cases = [
+            ('botocore.endpoint', logging.DEBUG, 'payload=%s', (f'opaque={ECHO}',)),
+            ('botocore.endpoint', logging.DEBUG, 'Response body: {"opaque":"%s"}' % ECHO, ()),
+            ('botocore.endpoint', logging.DEBUG, 'Making request with params: %s',
+             ({'body': {'Action': 'AssumeRoleWithSAML', 'SAMLAssertion': SAML_VALUE}},)),
+            ('botocore.parsers', logging.DEBUG, 'Response body:\n%r', (f'<x>{SESSION_TOKEN}</x>'.encode(),)),
+            ('some.lib', logging.INFO, 'cookie: sid=%s', (COOKIE_SID,)),
+            ('some.lib', logging.WARNING, f'failed opaque={ECHO}', ()),
+            ('urllib3.connectionpool', logging.WARNING,
+             "Retrying (%r) after connection broken by '%r': %s", ('Retry(total=2)', 'err', f'/x/{ECHO}')),
+        ]
+        with debug_capture() as output:
+            for name, level, msg, args in cases:
+                logging.getLogger(name).log(level, msg, *args)
+        text = output()
+        self.assertNoSecrets(text)
+        self.assertEqual(len(output.records), len(cases))
+        self.assertIn('[botocore.endpoint DEBUG message omitted]', output.records[0])
+        console = output.stderr.getvalue()
+        # Unrecognized DEBUG chatter is dropped from the console; higher levels leave a marker.
+        self.assertNotIn('DEBUG message omitted', console)
+        self.assertIn('[some.lib INFO message omitted]', console)
+        self.assertIn('[urllib3.connectionpool WARNING message omitted]', console)
+
+    def test_exception_messages_and_source_lines_are_never_printed(self):
+        with debug_capture() as output:
+            try:
+                try:
+                    raise ValueError(f'opaque={ECHO}')
+                except ValueError as exc:
+                    raise requests.HTTPError(
+                        f'401 Client Error for url: https://u:{PASSWORD}@example.okta.test/app?x={MFA_CLI}'
+                    ) from exc
+            except requests.HTTPError:
+                logging.getLogger('gimme_aws_creds.test').exception('request failed')
+                logging.getLogger('urllib3.connectionpool').warning('failed', exc_info=True)
+            logging.getLogger('gimme_aws_creds.test').debug('where', stack_info=True)
+        text = output()
+        self.assertNoSecrets(text)
+        self.assertIn('request failed', text)
+        self.assertIn('requests.exceptions.HTTPError [message omitted]', text)
+        self.assertIn('ValueError [message omitted]', text)
+        self.assertIn('test_debug_redaction.py", line', text)
+        self.assertNotIn('raise requests.HTTPError', text)
+
+    def test_records_created_without_the_factory_are_rendered_by_the_console(self):
+        with debug_capture() as output:
+            console = logging.getLogger().handlers[0]
+            console.handle(logging.makeLogRecord({
+                'name': 'some.lib', 'levelno': logging.WARNING, 'levelname': 'WARNING',
+                'msg': 'password=%s', 'args': (PASSWORD,), 'exc_text': f'Error: {ECHO}'}))
+        self.assertNoSecrets(output.stderr.getvalue())
+        self.assertIn('[some.lib WARNING message omitted]', output.stderr.getvalue())
+        self.assertIn('[exception text omitted]', output.stderr.getvalue())
+
+
+class TestLogFormatting(unittest.TestCase):
+    """Formatting compatibility without dumping arguments."""
+
+    def test_package_templates_interpolate_numbers_only(self):
+        with debug_capture() as output:
+            log = logging.getLogger('gimme_aws_creds.x')
+            log.info('operation=%(operation)s count=%(count)d',
+                     {'operation': 'AssumeRoleWithSAML', 'count': 3})
+            log.info('count=%d', 3)
+            log.info('ready=%s ratio=%.1f none=%s', True, 0.5, None)
+            log.info('value=%d', 'not-a-number')
+            log.info('%(missing)s', {'present': 1})
+        self.assertEqual(output.records, [
+            'operation=[REDACTED] count=3',
+            'count=3',
+            'ready=True ratio=0.5 none=None',
+            '[log message omitted: arguments do not match the format]',
+            '[log message omitted: arguments do not match the format]',
+        ])
+        self.assertNotIn('{', output.stderr.getvalue())
+
+    def test_other_loggers_mapping_style_is_bounded_omission(self):
+        with debug_capture() as output:
+            logging.getLogger('ordinary').info('operation=%(operation)s count=%(count)d',
+                                               {'operation': ECHO, 'count': 3})
+        self.assertEqual(output.records, ['[ordinary INFO message omitted]'])
+
+    def test_package_log_calls_use_constant_templates(self):
+        """The package-logger policy relies on format strings being code constants."""
+        package = Path(debug_formatter.__file__).parent
+        allowed_calls = {'format_request', 'format_response', 'format_resolved_configuration'}
+        methods = {'debug', 'info', 'warning', 'warn', 'error', 'exception', 'critical', 'log'}
+        problems = []
+        for path in sorted(package.glob('*.py')):
+            tree = ast.parse(path.read_text(), str(path))
+            formatted_names = {
+                target.id
+                for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Call)
+                and getattr(node.value.func, 'id', getattr(node.value.func, 'attr', None)) in allowed_calls
+                for target in node.targets if isinstance(target, ast.Name)
+            }
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in methods and isinstance(node.func.value, ast.Name)
+                        and 'log' in node.func.value.id.lower() and node.args):
+                    continue
+                arg = node.args[1] if node.func.attr == 'log' and len(node.args) > 1 else node.args[0]
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    continue
+                if isinstance(arg, ast.Call) and getattr(arg.func, 'attr', None) in allowed_calls:
+                    continue
+                if isinstance(arg, ast.Name) and arg.id in formatted_names:
+                    continue
+                problems.append(f'{path.name}:{node.lineno}')
+        self.assertEqual(problems, [])
 
 
 class TestRecordFactory(unittest.TestCase):
