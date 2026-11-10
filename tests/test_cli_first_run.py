@@ -6,7 +6,8 @@ environment and a closed standard input. A small bootstrap installs tripwires
 before the program is imported: network access, file writes, process or
 browser launches and credential backend lookups end the process immediately
 with GUARD_EXIT_CODE, so a regression fails the test instead of reaching a
-real service or the user's keychain.
+real service or the user's keychain. Writes to the operating system null device
+are allowed because dependencies use it to discard diagnostics.
 """
 import os
 import shutil
@@ -62,6 +63,9 @@ def audit(event, args):
         trip("network access (" + event + ")")
     elif event == "open":
         path, mode, flags = args
+        # Dependencies may discard diagnostics without creating a file.
+        if path == os.devnull:
+            return
         if (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
                 isinstance(flags, int) and flags & WRITE_FLAGS):
             trip("file write (" + repr(path) + ")")
@@ -113,6 +117,10 @@ class IsolatedEntryPointMixin:
             'TEMP': str(self.root / 'tmp'),
             'TMP': str(self.root / 'tmp'),
             'PYTHON_KEYRING_BACKEND': 'keyring.backends.null.Keyring',
+            # PyCryptodome's optional GMP discovery invokes ldconfig on Linux.
+            # These CLI checks do not exercise RSA arithmetic; keep process
+            # launches forbidden by using its bundled arithmetic backend.
+            'PYCRYPTODOME_DISABLE_GMP': '1',
         }
         for name in ('PATH', 'SYSTEMROOT'):
             if name in os.environ:
@@ -149,7 +157,24 @@ class TestEntryPointGuards(IsolatedEntryPointMixin, unittest.TestCase):
         ('network', 'import socket\nsocket.getaddrinfo("localhost", 443)\n'),
         ('credential backend', 'import keyring\nkeyring.get_password("gimme-aws-creds", "probe")\n'),
         ('file write', 'open("probe-output.txt", "w").close()\n'),
+        ('null-named regular file', 'open("null", "w").close()\n'),
+        ('subprocess', 'import subprocess, sys\nsubprocess.run([sys.executable, "-c", "pass"])\n'),
     )
+
+    def test_null_device_writes_are_allowed(self):
+        self.script = self.root / 'probe.py'
+        self.script.write_text(
+            'import os\n'
+            'with open(os.devnull, "w") as sink:\n'
+            '    sink.write("discarded")\n'
+            'fd = os.open(os.devnull, os.O_WRONLY)\n'
+            'os.write(fd, b"discarded")\n'
+            'os.close(fd)\n')
+        before = self.snapshot()
+        result = self.run_cli()
+        self.assert_no_guard_tripped(result)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.snapshot(), before)
 
     def test_guards_stop_forbidden_operations(self):
         self.script = self.root / 'probe.py'
