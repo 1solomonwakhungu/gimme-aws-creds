@@ -38,14 +38,20 @@ class TestMaskConfigValue(unittest.TestCase):
         self.assertEqual(_mask_config_value('password', False), False)
 
     def test_non_sensitive_key_passes_through(self):
-        self.assertEqual(_mask_config_value('client_id', 'abc123'), 'abc123')
+        client_id = '0oa1b2c3d4E5F6g7H8i9'
+        self.assertEqual(_mask_config_value('client_id', client_id), client_id)
         self.assertEqual(_mask_config_value('okta_org_url', 'https://x'), 'https://x')
+
+    def test_known_key_with_value_of_wrong_type_is_REDACTED(self):
+        self.assertEqual(_mask_config_value('client_id', 'abc123'), '[REDACTED]')
+        self.assertEqual(_mask_config_value('device_flow_scope', 'openid hunter2'), '[REDACTED]')
+        self.assertEqual(_mask_config_value('device_flow_scope', 'openid okta.apps.sso'),
+                         'openid okta.apps.sso')
 
     def test_password_is_REDACTED(self):
         result = _mask_config_value('okta_password', 'mypassword12345')
-        self.assertIn('[REDACTED]', result)
-        # Long values keep first 4 chars as a fingerprint
-        self.assertTrue(result.startswith('mypa'))
+        # The whole value is replaced; no prefix survives as a fingerprint
+        self.assertEqual(result, '[REDACTED]')
 
     def test_short_value_fully_REDACTED(self):
         result = _mask_config_value('password', 'short')
@@ -184,7 +190,7 @@ class TestFormatResolvedConfiguration(unittest.TestCase):
             "[myprofile]\nclient_id = foo\n",
         )
         out = format_resolved_configuration(config, conf_dict)
-        self.assertIn('default location', out)
+        self.assertIn('configuration path discovery', out)
         self.assertNotIn('env: OKTA_CONFIG', out)
 
     def test_env_okta_config_path_label(self):
@@ -354,9 +360,11 @@ class TestDebugSamlRedaction(unittest.TestCase):
 
         out = DebugFormatter.format_request(Request())
 
+        self.assertIn("GET https://nike.okta.com/login/token/sso?", out)
         self.assertIn("token=[REDACTED]", out)
-        self.assertIn("fromURI=/app/UserHome", out)
-        self.assertIn("token_type=urn%3Atest", out)
+        # Redirect targets can carry tokens, and token_type only shows known values
+        self.assertIn("fromURI=[REDACTED]", out)
+        self.assertIn("token_type=[REDACTED]", out)
         self.assertNotIn("RAW-URL-TOKEN-VALUE", out)
         self.assertNotIn("RAW-URL", out)
 
@@ -376,8 +384,11 @@ class TestDebugSamlRedaction(unittest.TestCase):
         )
 
         self.assertIn('"access_token": "[REDACTED]"', out)
-        self.assertIn('"id_token": "[REDACTED]"', out)
-        self.assertIn('"sessionToken": "[REDACTED]"', out)
+        # Known containers that hold identities are hidden as a whole, and
+        # unknown containers are not traversed at all.
+        self.assertIn('"profile": "[REDACTED]"', out)
+        self.assertIn('"[omitted]": "1 unrecognized field"', out)
+        self.assertNotIn('items', out)
         self.assertNotIn("RAW-ACCESS", out)
         self.assertNotIn("RAW-ID", out)
         self.assertNotIn("RAW-SESSION", out)
@@ -452,7 +463,7 @@ class TestDebugSamlRedaction(unittest.TestCase):
 
         out = DebugFormatter.format_response(PlainTextResponse())
 
-        self.assertIn("AWS STS SAML response redacted", out)
+        self.assertIn("[body omitted:", out)
         self.assertNotIn("RAW-SECRET", out)
         self.assertNotIn("AssumeRoleWithSAMLResponse", out)
 
@@ -462,6 +473,7 @@ class TestDebugSamlRedaction(unittest.TestCase):
         old_handlers = root_logger.handlers[:]
         old_level = root_logger.level
         old_gac_level = gac_logger.level
+        old_record_factory = logging.getLogRecordFactory()
         stream = io.StringIO()
 
         try:
@@ -488,10 +500,10 @@ class TestDebugSamlRedaction(unittest.TestCase):
                 root_logger.addHandler(handler)
             root_logger.setLevel(old_level)
             gac_logger.setLevel(old_gac_level)
+            logging.setLogRecordFactory(old_record_factory)
 
         out = stream.getvalue()
-        self.assertIn("OperationModel(name=AssumeRoleWithSAML)", out)
-        self.assertIn("Action': 'AssumeRoleWithSAML", out)
+        self.assertIn("Making request for operation AssumeRoleWithSAML [parameters omitted]", out)
         self.assertNotIn("RAW-SAML-ASSERTION-TOKEN", out)
         self.assertNotIn("RAW-RESPONSE", out)
         self.assertNotIn("AssumeRoleWithSAMLResponse", out)
