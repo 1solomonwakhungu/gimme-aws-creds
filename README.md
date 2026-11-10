@@ -306,11 +306,23 @@ You can also set up different Okta configuration profiles, which is useful if yo
 gimme-aws-creds --action-configure --profile profileName
 ```
 
-The wizard prompts you to enter the necessary configuration parameters; the only one that is required is `okta_org_url`. The configuration file is written to `~/.okta_aws_login_config` (override with the `OKTA_CONFIG` environment variable).
+The wizard prompts you to enter the necessary configuration parameters; the only one that is required is `okta_org_url`. The `OKTA_CONFIG` environment variable explicitly selects the configuration file.
+Without an override, an existing `~/.okta_aws_login_config` takes precedence.
+On Linux and macOS, other installations use `$XDG_CONFIG_HOME/gimme-aws-creds/config`,
+or `~/.config/gimme-aws-creds/config` when `XDG_CONFIG_HOME` is unset, empty or relative.
+Windows keeps the legacy home-file default. If both legacy and XDG files exist,
+the legacy file wins; use `OKTA_CONFIG` to select the XDG file explicitly.
+
+Configuration writes create missing parent directories (0700 on POSIX), without
+changing permissions on existing directories. Configuration reads create no directories.
+Existing files are never automatically moved or merged. AWS/Alibaba credential files,
+keyrings and registered authenticator files keep their existing locations.
+
+If no configuration file exists, running `gimme-aws-creds` starts the same wizard automatically. `--help` and `--version` work without a configuration file and do not start the wizard.
 
 ### Configuration File Format
 
-The config file follows a [configfile](https://docs.python.org/3/library/configparser.html) format. By default, it is located at `$HOME/.okta_aws_login_config`.
+The config file follows a [configfile](https://docs.python.org/3/library/configparser.html) format. Its location follows the configuration path precedence described above.
 
 Example file:
 
@@ -404,7 +416,7 @@ You can override values from the config section with environment variables. This
 | `GIMME_AWS_CREDS_ENABLE_ALICLOUD` | Corresponds to `enable_alicloud` and `--enable-alicloud`. |
 | `OKTA_API_KEY` | Required if `gimme_creds_server = internal`. |
 | `OKTA_AUTH_SERVER` | Corresponds to `okta_auth_server`. |
-| `OKTA_CONFIG` | Override location of the gimme-aws-creds config file (default `~/.okta_aws_login_config`). |
+| `OKTA_CONFIG` | Override location of the gimme-aws-creds config file; see Configuration for legacy/XDG precedence. |
 | `OKTA_DEVICE_TOKEN` | Corresponds to `device_token`; useful in CI. |
 | `OKTA_MFA_CODE` | Corresponds to `--mfa-code`. |
 | `OKTA_PASSWORD` | Provides password during authentication; useful in CI. |
@@ -482,13 +494,15 @@ Writing to the AWS credentials file includes the `x_security_token_expires` valu
 
 ### Store Credentials from JSON
 
-`gimme-aws-creds --action-store-json-creds` stores JSON-formatted credentials read from `stdin` into the AWS credentials file. Example:
+`gimme-aws-creds --action-store-json-creds` stores JSON-formatted credentials read from `stdin` into the AWS credentials file (or the Alibaba Cloud config file for Alibaba Cloud credentials). Example:
 
 ```bash
 gimme-aws-creds -o json | gimme-aws-creds --action-store-json-creds
 ```
 
 Data can be modified by scripts in between.
+
+Each line is stored according to its `credentials.credentials_type` (`aws` or `alibaba_cloud`), regardless of whether the active profile enables Alibaba Cloud. Lines without `credentials_type`, as produced by releases before Alibaba Cloud support, are stored as AWS credentials. Credentials are written to the line's `shared_credentials_file`, or to the provider's default file if it is not set. Lines with missing fields, an unsupported `credentials_type`, or no `credentials_type` but Alibaba Cloud fields are skipped with a warning.
 
 ## Python API
 
@@ -526,8 +540,10 @@ for data in creds.iter_selected_aws_credentials():
         raise ValueError("Didn't find aws_account_id (12 digits) in {}".format(arn))
 
     data['profile']['name'] = 'okta-{}'.format(account_id)
-    creds.write_aws_creds_from_data(data)
+    creds.write_credentials_from_data(data)
 ```
+
+`write_credentials_from_data(data, credentials_file=None)` writes AWS and Alibaba Cloud credentials. `credentials_file` takes precedence over the record's `shared_credentials_file`. Scripts written for earlier releases can keep calling `write_aws_creds_from_data(data, aws_config=None)`; it stores AWS credentials only, gives `aws_config` the same precedence, and skips records of other types with a warning.
 
 ## Cloud Provider Support
 

@@ -1,0 +1,7 @@
+# Test-only tools installed into the environment holding the built wheel, after
+# its runtime dependencies were resolved and audited. Packages shared with the
+# runtime dependency set (requests, urllib3, certifi, idna, charset-normalizer,
+# PyYAML) are deliberately not pinned here so the tested environment keeps the
+# versions the wheel resolved; `pip check` runs again after installation.
+pytest
+responses
