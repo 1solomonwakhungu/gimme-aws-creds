@@ -1,11 +1,12 @@
 """Unit tests for gimme_aws_creds.config.Config"""
 import os
+import shutil
 import unittest
 from unittest.mock import patch
 
-from gimme_aws_creds import ui, errors
+from gimme_aws_creds import ui, errors, version
 from gimme_aws_creds.config import Config
-from tests.helpers import make_args
+from tests.helpers import captured_output, make_args
 from tests.user_interface_mock import MockUserInterface
 
 
@@ -598,3 +599,75 @@ okta_org_url = https://example.okta.com
 
         # Should produce output without raising
         self.assertTrue(any('RESOLVED CONFIGURATION' in m for m in captured.output))
+
+
+class TestFirstRunArguments(unittest.TestCase):
+    """When no configuration file exists, informational and invalid
+    arguments must exit before the first-time configuration wizard starts."""
+
+    def setUp(self):
+        self._homes = []
+
+    def tearDown(self):
+        for home in self._homes:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def _first_run_ui(self, *args):
+        test_ui = MockUserInterface(argv=['gimme-aws-creds', *args])
+        self._homes.append(test_ui.HOME)
+        return test_ui
+
+    def _construct_expecting_exit(self, *args):
+        """Construct Config on a first run and return (exit code, stdout, stderr)."""
+        test_ui = self._first_run_ui(*args)
+        with patch.object(Config, 'update_config_file') as wizard, \
+                captured_output() as (out, err), \
+                self.assertRaises(SystemExit) as raised:
+            Config(gac_ui=test_ui)
+        wizard.assert_not_called()
+        self.assertEqual(os.listdir(test_ui.HOME), [])
+        return raised.exception.code, out.getvalue(), err.getvalue()
+
+    def test_help_exits_before_first_time_configuration(self):
+        for args in (['--help'], ['-h'], ['--profile', 'work', '--help']):
+            with self.subTest(args=args):
+                code, out, _ = self._construct_expecting_exit(*args)
+                self.assertEqual(code, 0)
+                self.assertIn('usage:', out)
+                self.assertIn('--action-configure', out)
+
+    def test_version_exits_before_first_time_configuration(self):
+        code, out, _ = self._construct_expecting_exit('--version')
+        self.assertEqual(code, 0)
+        self.assertIn(version, out)
+
+    def test_invalid_argument_exits_before_first_time_configuration(self):
+        code, _, err = self._construct_expecting_exit('--no-such-option')
+        self.assertEqual(code, 2)
+        self.assertIn('--no-such-option', err)
+
+    def test_no_arguments_still_start_first_time_configuration(self):
+        test_ui = self._first_run_ui()
+        with patch.object(Config, 'update_config_file') as wizard:
+            Config(gac_ui=test_ui)
+        wizard.assert_called_once_with()
+
+    def test_valid_arguments_still_start_first_time_configuration(self):
+        test_ui = self._first_run_ui('--profile', 'work', '--disable-keychain')
+        with patch.object(Config, 'update_config_file') as wizard:
+            Config(gac_ui=test_ui)
+        wizard.assert_called_once_with()
+
+    def test_existing_configuration_file_does_not_start_wizard(self):
+        test_ui = self._first_run_ui('--help')
+        with open(os.path.join(test_ui.HOME, '.okta_aws_login_config'), 'w') as f:
+            f.write('[DEFAULT]\nokta_org_url = https://example.invalid\n')
+        with patch.object(Config, 'update_config_file') as wizard:
+            Config(gac_ui=test_ui)
+        wizard.assert_not_called()
+
+    def test_create_config_false_does_not_parse_arguments(self):
+        test_ui = self._first_run_ui('--help')
+        with patch.object(Config, 'update_config_file') as wizard:
+            Config(gac_ui=test_ui, create_config=False)
+        wizard.assert_not_called()

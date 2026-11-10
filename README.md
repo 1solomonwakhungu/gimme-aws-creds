@@ -309,9 +309,11 @@ changing permissions on existing directories. Configuration reads create no dire
 Existing files are never automatically moved or merged. AWS/Alibaba credential files,
 keyrings and registered authenticator files keep their existing locations.
 
+If no configuration file exists, running `gimme-aws-creds` starts the same wizard automatically. `--help` and `--version` work without a configuration file and do not start the wizard.
+
 ### Configuration File Format
 
-The config file follows a [configfile](https://docs.python.org/3/library/configparser.html) format. By default, it is located at `$HOME/.okta_aws_login_config`.
+The config file follows a [configfile](https://docs.python.org/3/library/configparser.html) format. Its location follows the configuration path precedence described above.
 
 Example file:
 

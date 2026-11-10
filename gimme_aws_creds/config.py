@@ -89,6 +89,10 @@ class Config:
             }
 
         if create_config and not os.path.isfile(self.OKTA_CONFIG):
+            # Validate the command line before prompting, so that --help,
+            # --version and invalid arguments exit without starting the
+            # first-time configuration wizard. get_args() applies the values.
+            self._build_arg_parser().parse_args(self.ui.args)
             self.ui.notify('No gimme-aws-creds configuration file found, starting first-time configuration...')
             self.update_config_file()
 
@@ -133,8 +137,8 @@ class Config:
                 if not os.path.isdir(directory):
                     raise
 
-    def get_args(self):
-        """Get the CLI args"""
+    def _build_arg_parser(self):
+        """Build the CLI argument parser"""
         parser = argparse.ArgumentParser(
             description="Gets a STS token to use for AWS or Alibaba Cloud CLI based on a SAML assertion from Okta"
         )
@@ -240,6 +244,11 @@ class Config:
                  'Requires optional dependencies: pip install "gimme-aws-creds[alicloud]". '
                  'Can also be set per-profile as enable_alicloud in the config file.'
         )
+        return parser
+
+    def get_args(self):
+        """Get the CLI args"""
+        parser = self._build_arg_parser()
         args = parser.parse_args(self.ui.args)
 
         # Track which CLI flags were explicitly provided (i.e. differ from
