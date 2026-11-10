@@ -49,6 +49,23 @@ class AtomicConfigWriteTest(unittest.TestCase):
     def leftovers(self, directory=None):
         return [p.name for p in (directory or self.home).iterdir() if p.name.endswith('.tmp')]
 
+    def fake_ownership(self, uid_offset=0, gid_offset=0):
+        """Report the config file as owned by another uid/gid (no real chown)."""
+        real_lstat = os.lstat
+        target = self.path
+
+        def fake_lstat(path, *args, **kwargs):
+            result = real_lstat(path, *args, **kwargs)
+            name = os.fspath(path)
+            if name == str(target) or (kwargs.get('dir_fd') is not None and name == target.name):
+                fields = list(result)
+                fields[4] += uid_offset
+                fields[5] += gid_offset
+                return os.stat_result(fields)
+            return result
+
+        return patch('gimme_aws_creds.config.os.lstat', side_effect=fake_lstat)
+
     def with_umask(self, mask):
         previous = os.umask(mask)
         self.addCleanup(os.umask, previous)
@@ -211,6 +228,149 @@ class AtomicConfigWriteTest(unittest.TestCase):
                 self.write()
         self.assertEqual(victim.read_text(), '[victim]\n')
 
+    def temp_entries(self, directory):
+        return [p for p in directory.iterdir() if p.name.endswith('.tmp')]
+
+    @unittest.skipUnless(POSIX, 'POSIX directory descriptors')
+    def test_parent_directory_swap_cannot_redirect_write(self):
+        # Another process renames the parent away and recreates it with its
+        # own file under the temporary name just before the rename.
+        live = self.home / 'live'
+        live.mkdir()
+        path = live / 'config'
+        path.write_text('[DEFAULT]\nclient_id = old\n')
+        os.chmod(path, 0o600)
+        parked = self.home / 'parked'
+        real_replace = os.replace
+
+        def swap_parent(src, dst, *args, **kwargs):
+            live.rename(parked)
+            live.mkdir()
+            planted = live / os.path.basename(src)
+            planted.write_text('[DEFAULT]\nclient_id = attacker\n')
+            os.chmod(planted, 0o644)
+            return real_replace(src, dst, *args, **kwargs)
+
+        with patch('gimme_aws_creds.config.os.replace', side_effect=swap_parent):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'moved or replaced'):
+                self.write('new', path=path)
+        self.assertFalse(path.exists())
+        self.assertIn('new', (parked / 'config').read_text())
+        self.assertEqual(file_mode(parked / 'config'), 0o600)
+        self.assertEqual(self.temp_entries(parked), [])
+
+    @unittest.skipUnless(POSIX, 'POSIX symlinks')
+    def test_temp_entry_swapped_before_rename_is_refused(self):
+        original = '[DEFAULT]\nclient_id = original\n'
+        self.path.write_text(original)
+        os.chmod(self.path, 0o600)
+        victim = self.home / 'victim'
+        victim.write_text('victim data')
+        real_fsync = os.fsync
+        planted = []
+
+        def swap_temp(fd):
+            real_fsync(fd)
+            if not planted:
+                (entry,) = self.temp_entries(self.home)
+                entry.unlink()
+                entry.symlink_to(victim)
+                planted.append(entry)
+
+        with patch('gimme_aws_creds.config.os.fsync', side_effect=swap_temp):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'temporary file was replaced'):
+                self.write('new')
+        self.assertFalse(self.path.is_symlink())
+        self.assertEqual(self.path.read_text(), original)
+        self.assertEqual(victim.read_text(), 'victim data')
+        # Someone else's entry is not ours to delete.
+        self.assertTrue(planted[0].is_symlink())
+
+    @unittest.skipUnless(POSIX, 'POSIX symlinks')
+    def test_temp_entry_swapped_at_rename_is_reported(self):
+        # Publication cannot be prevented here; the write must not succeed.
+        self.path.write_text('[DEFAULT]\nclient_id = original\n')
+        os.chmod(self.path, 0o600)
+        victim = self.home / 'victim'
+        victim.write_text('victim data')
+        real_replace = os.replace
+
+        def swap_temp(src, dst, *args, **kwargs):
+            entry = self.home / os.path.basename(src)
+            entry.unlink()
+            entry.symlink_to(victim)
+            return real_replace(src, dst, *args, **kwargs)
+
+        with patch('gimme_aws_creds.config.os.replace', side_effect=swap_temp):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'changed by another process'):
+                self.write('new')
+        self.assertEqual(victim.read_text(), 'victim data')
+
+    def final_link_fixture(self):
+        intended = self.home / 'intended'
+        intended.write_text('[DEFAULT]\nclient_id = old\n')
+        unexpected = self.home / 'unexpected'
+        unexpected.write_text('[DEFAULT]\nclient_id = untouched\n')
+        self.path.symlink_to(intended)
+        return intended, unexpected
+
+    @unittest.skipUnless(POSIX, 'POSIX symlinks')
+    def test_final_symlink_replaced_after_check_is_refused(self):
+        intended, unexpected = self.final_link_fixture()
+        real_readlink = os.readlink
+        swapped = []
+
+        def swap_link(path, *args, **kwargs):
+            if not swapped:
+                self.path.unlink()
+                self.path.symlink_to(unexpected)
+                swapped.append(True)
+            return real_readlink(path, *args, **kwargs)
+
+        with patch('gimme_aws_creds.config.os.readlink', side_effect=swap_link):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'Refusing to follow.*changed'):
+                self.write('new')
+        self.assertIn('old', intended.read_text())
+        self.assertIn('untouched', unexpected.read_text())
+        self.assertEqual(self.leftovers(), [])
+
+    @unittest.skipUnless(POSIX, 'POSIX symlinks')
+    def test_final_symlink_swapped_out_and_back_is_refused(self):
+        # The checked link is moved aside during readlink and then restored.
+        intended, unexpected = self.final_link_fixture()
+        aside = self.home / 'aside'
+        real_readlink = os.readlink
+        swapped = []
+
+        def swap_and_restore(path, *args, **kwargs):
+            if swapped:
+                return real_readlink(path, *args, **kwargs)
+            swapped.append(True)
+            os.rename(self.path, aside)
+            self.path.symlink_to(unexpected)
+            try:
+                return real_readlink(path, *args, **kwargs)
+            finally:
+                os.replace(aside, self.path)
+
+        with patch('gimme_aws_creds.config.os.readlink', side_effect=swap_and_restore):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'Refusing to follow.*changed'):
+                self.write('new')
+        self.assertIn('old', intended.read_text())
+        self.assertIn('untouched', unexpected.read_text())
+
+    @unittest.skipUnless(POSIX, 'POSIX symlinks')
+    def test_symlink_chain_is_followed_when_every_link_is_trusted(self):
+        (self.home / 'dir').mkdir()
+        real = self.home / 'dir' / 'real'
+        real.write_text('')
+        (self.home / 'dir' / 'middle').symlink_to('real')
+        self.path.symlink_to(Path('dir') / 'middle')
+        self.write('chained')
+        self.assertTrue(self.path.is_symlink())
+        self.assertIn('chained', real.read_text())
+        self.assertEqual(file_mode(real), 0o600)
+
     def test_non_regular_destination_is_refused(self):
         self.path.mkdir()
         with self.assertRaisesRegex(GimmeAWSCredsError, 'not a regular file'):
@@ -238,21 +398,40 @@ class AtomicConfigWriteTest(unittest.TestCase):
     def test_foreign_owner_is_not_silently_replaced(self):
         original = '[DEFAULT]\nclient_id = original\n'
         self.path.write_text(original)
-        real = os.stat(self.path)
-        foreign = os.stat_result((real.st_mode, real.st_ino, real.st_dev, real.st_nlink,
-                                  real.st_uid + 1, real.st_gid, real.st_size,
-                                  real.st_atime, real.st_mtime, real.st_ctime))
-        real_lstat = os.lstat
-
-        def fake_lstat(path, *args, **kwargs):
-            result = real_lstat(path, *args, **kwargs)
-            return foreign if os.fspath(path) == str(self.path) else result
-
-        with patch('gimme_aws_creds.config.os.lstat', side_effect=fake_lstat), \
-                patch('gimme_aws_creds.config.os.fchown', side_effect=PermissionError(1, 'denied')):
+        with self.fake_ownership(uid_offset=1), \
+                patch('gimme_aws_creds.config.os.fchown', side_effect=PermissionError(1, 'denied')) as fchown:
             with self.assertRaisesRegex(GimmeAWSCredsError, 'owned by another user'):
                 self.write()
+        fchown.assert_called_once()
         self.assertEqual(self.path.read_text(), original)
+        self.assertEqual(self.leftovers(), [])
+
+    @unittest.skipUnless(POSIX, 'POSIX ownership')
+    def test_group_that_cannot_be_kept_refuses_replacement(self):
+        # Same owner, but the file's group is one the owner may not assign.
+        original = '[DEFAULT]\nclient_id = original\n'
+        self.path.write_text(original)
+        os.chmod(self.path, 0o600)
+        gid = os.stat(self.path).st_gid
+        with self.fake_ownership(gid_offset=12345), \
+                patch('gimme_aws_creds.config.os.fchown', side_effect=PermissionError(1, 'denied')) as fchown:
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'group .* cannot be kept'):
+                self.write('new')
+        fchown.assert_called_once()
+        self.assertEqual(self.path.read_text(), original)
+        self.assertEqual(os.stat(self.path).st_gid, gid)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_long_valid_file_name_can_be_rewritten(self):
+        path = self.home / ('n' * 240)
+        try:
+            path.write_text('[DEFAULT]\nclient_id = old\n')
+        except OSError as exc:
+            self.skipTest('filesystem rejects a 240-character name: {}'.format(exc))
+        self.write('new', path=path)
+        self.assertIn('new', path.read_text())
+        if POSIX:
+            self.assertEqual(file_mode(path), 0o600)
         self.assertEqual(self.leftovers(), [])
 
     @unittest.skipUnless(POSIX, 'POSIX symlink traversal')

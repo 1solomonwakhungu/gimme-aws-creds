@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and* limitations
 """
 import argparse
 import configparser
+import errno
 import io
 import os
 import secrets
@@ -21,6 +22,11 @@ from urllib.parse import urlparse
 
 from . import errors, ui, version
 from .common import user_agent
+
+# Whether the config writer can pin directories with descriptors. os.replace()
+# and os.rename() share renameat(), but only os.rename is listed in
+# supports_dir_fd, so test that rather than os.replace.
+_DIR_FD_SUPPORTED = {os.open, os.lstat, os.readlink, os.rename, os.unlink} <= os.supports_dir_fd
 
 
 class Config:
@@ -491,6 +497,11 @@ class Config:
 
     # Owner read/write only: the config can hold an Okta device token.
     _CONFIG_FILE_MODE = 0o600
+    # Symlinks followed from the configuration path before giving up (ELOOP).
+    _MAX_CONFIG_SYMLINKS = 40
+    # Destination characters kept in the temporary name; the rest of the name
+    # is fixed-length, so a valid destination name always fits.
+    _TEMP_NAME_PREFIX = 32
 
     def _write_private_config(self, path, data):
         """Atomically create or replace ``path`` with owner-only permissions.
@@ -498,102 +509,216 @@ class Config:
         The data is written to a uniquely named temporary file in the
         destination directory, created with O_EXCL (and O_NOFOLLOW where
         available) and mode 0600, flushed to disk and then renamed over the
-        destination. Readers therefore see either the old or the new file,
-        never a partial one, and an interrupted write leaves the original
-        untouched.
+        destination. Readers see either the old or the new file, never a
+        partial one. An error raised before the rename leaves the original
+        untouched and removes the temporary file; a crash can leave the
+        temporary file behind.
 
         * Group/other permission bits on an existing file are removed (with a
           warning); owner bits are kept, so a rewrite never widens the mode.
           A file that is not owner-writable is refused, as open() would.
-        * The existing owner and group are kept. If the owner cannot be kept
-          (only root may give a file away), the write is refused rather than
-          silently transferring ownership.
-        * If the path itself is a symlink, the regular file it points to is
-          replaced, provided the link is owned by the current user or root.
+        * The existing owner and group are kept. If either cannot be kept
+          (only root may give a file away, and only a member may assign a
+          group), the write is refused rather than changing ownership.
+        * If the path is a symlink, the regular file it points to is replaced,
+          provided every link followed is owned by the current user or root.
           Dangling links, links owned by other users and links to anything
           other than a regular file are refused. A symlink to a directory
           earlier in the path, followed by '..', resolves as the kernel does;
           the path is never normalized lexically.
 
-        Windows: the temporary file inherits the ACL of its directory (by
-        default the user profile, which is private) and ``os.chmod`` only
+        On POSIX systems every directory involved is opened once and all
+        later operations are relative to that descriptor, so renaming or
+        replacing a parent directory cannot redirect the write. A link is
+        refused if it changes while it is being read, the temporary file must
+        still be the one written when it is renamed, and the write fails if
+        the published file or any directory used no longer matches afterwards.
+        These checks detect, but cannot prevent, another user who can modify
+        a directory on the path from changing it after the rename.
+
+        Windows: directory descriptors are not available, so the path is
+        resolved by name. The temporary file inherits the ACL of its directory
+        (by default the user profile, which is private) and ``os.chmod`` only
         toggles the read-only flag, so POSIX modes and ownership are not
-        enforced there. Replacement fails if another process holds the
-        config open.
+        enforced there.
         """
         posix = os.name != 'nt'
-        target = self._resolve_config_target(path, posix)
-        directory, name = os.path.split(target)
+        pinned = posix and _DIR_FD_SUPPORTED
+        opened = []
+        try:
+            directory, name, existing = self._locate_config_target(path, posix, pinned, opened)
+            self._replace_config(path, directory, name, existing, data, posix, opened)
+        finally:
+            for _, fd in opened:
+                os.close(fd)
+
+    @staticmethod
+    def _at(directory, name):
+        """Return the path and dir_fd arguments for ``name`` in ``directory``."""
+        directory_path, fd = directory
+        if fd is None:
+            return os.path.join(directory_path, name), None
+        return name, fd
+
+    @staticmethod
+    def _open_directory(directory_path, entry, dir_fd, pinned, opened):
+        """Open a directory once, resolving it as open() would.
+
+        ``directory_path`` names the directory in messages and later checks;
+        ``entry`` is opened relative to ``dir_fd``.
+        """
+        if not pinned:
+            return directory_path, None
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_CLOEXEC', 0)
+        fd = os.open(entry, flags, dir_fd=dir_fd)
+        opened.append((directory_path, fd))
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), directory_path)
+        return directory_path, fd
+
+    def _locate_config_target(self, path, posix, pinned, opened):
+        """Find the directory and name to replace, following trusted symlinks.
+
+        Returns ``(directory, name, existing)`` where ``existing`` is the
+        lstat result of the current file, or None if there is none yet.
+        """
+        directory_path, name = os.path.split(path)
         if not name:
             raise errors.GimmeAWSCredsError(
                 'Cannot write configuration file {}: not a file path'.format(path))
-        directory = directory or os.curdir
+        directory_path = directory_path or os.curdir
+        directory = self._open_directory(directory_path, directory_path, None, pinned, opened)
 
-        try:
-            existing = os.lstat(target)
-        except FileNotFoundError:
-            existing = None
-        if existing is not None and not stat.S_ISREG(existing.st_mode):
-            raise errors.GimmeAWSCredsError(
-                'Refusing to replace configuration file {}: not a regular file'.format(target))
+        def refuse_link(reason):
+            return errors.GimmeAWSCredsError(
+                'Refusing to follow configuration symlink {}: {}'.format(path, reason))
 
+        followed = 0
+        while True:
+            entry, dir_fd = self._at(directory, name)
+            try:
+                link = os.lstat(entry, dir_fd=dir_fd)
+            except FileNotFoundError as exc:
+                if followed:
+                    raise refuse_link(exc.strerror) from exc
+                return directory, name, None
+            if not stat.S_ISLNK(link.st_mode):
+                if stat.S_ISREG(link.st_mode):
+                    return directory, name, link
+                if followed:
+                    raise refuse_link('target is not a regular file')
+                raise errors.GimmeAWSCredsError(
+                    'Refusing to replace configuration file {}: not a regular file'.format(path))
+            if followed >= self._MAX_CONFIG_SYMLINKS:
+                raise refuse_link(os.strerror(errno.ELOOP))
+            if posix and link.st_uid not in (os.geteuid(), 0):
+                raise refuse_link('owned by another user')
+            target = os.readlink(entry, dir_fd=dir_fd)
+            # A link's text cannot change in place; if the entry is still the
+            # same checked link (renaming it updates ctime), the text is its own.
+            if self._link_identity(os.lstat(entry, dir_fd=dir_fd)) != self._link_identity(link):
+                raise refuse_link('it changed while being read')
+            followed += 1
+
+            target_directory, name = os.path.split(target)
+            if name in ('', os.curdir, os.pardir):
+                raise refuse_link('target is not a regular file')
+            if target_directory:
+                display = os.path.join(directory[0], target_directory)
+                try:
+                    directory = self._open_directory(
+                        display, target_directory, directory[1], pinned, opened)
+                except OSError as exc:
+                    raise refuse_link(exc.strerror) from exc
+
+    @staticmethod
+    def _link_identity(st):
+        return st.st_dev, st.st_ino, st.st_uid, st.st_ctime_ns, st.st_mode
+
+    def _replace_config(self, path, directory, name, existing, data, posix, opened):
+        """Write ``data`` to a temporary file in ``directory`` and rename it."""
         mode = self._CONFIG_FILE_MODE
         if existing is not None and posix:
             current = stat.S_IMODE(existing.st_mode)
             mode = current & self._CONFIG_FILE_MODE
             if not mode & stat.S_IWUSR and os.geteuid() != 0:
                 raise errors.GimmeAWSCredsError(
-                    'Refusing to replace configuration file {}: it is read-only'.format(target))
+                    'Refusing to replace configuration file {}: it is read-only'.format(path))
             if current & ~self._CONFIG_FILE_MODE:
                 self.ui.warning(
                     'Configuration file {} had permissions {:04o}; restricting them to {:04o}.'.format(
-                        target, current, mode))
+                        path, current, mode))
 
-        temp_name = os.path.join(directory, '.{}.{}.tmp'.format(name, secrets.token_hex(8)))
+        temp = '.{}.{}.tmp'.format(name[:self._TEMP_NAME_PREFIX], secrets.token_hex(8))
+        temp_entry, temp_dir_fd = self._at(directory, temp)
+        target_entry, target_dir_fd = self._at(directory, name)
         flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
                  | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
-        fd = os.open(temp_name, flags, self._CONFIG_FILE_MODE)
+        handle = os.fdopen(os.open(temp_entry, flags, self._CONFIG_FILE_MODE, dir_fd=temp_dir_fd), 'w')
+        written = os.fstat(handle.fileno())
+        committed = False
         try:
-            with os.fdopen(fd, 'w') as handle:
-                if posix:
-                    if existing is not None:
-                        self._preserve_ownership(handle.fileno(), existing, target)
-                    # Apply the mode explicitly: open() is subject to umask.
-                    os.fchmod(handle.fileno(), mode)
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_name, target)
+            if posix:
+                if existing is not None:
+                    self._preserve_ownership(handle.fileno(), existing, path)
+                # Apply the mode explicitly: open() is subject to umask.
+                os.fchmod(handle.fileno(), mode)
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            if not posix:
+                # Windows cannot rename a file that is still open.
+                handle.close()
+            # On POSIX the handle stays open, so the inode cannot be reused.
+            if posix and not self._is_same_file(temp_entry, temp_dir_fd, written):
+                raise errors.GimmeAWSCredsError(
+                    'Refusing to replace configuration file {}: the temporary file was '
+                    'replaced by another process'.format(path))
+            os.replace(temp_entry, target_entry, src_dir_fd=temp_dir_fd, dst_dir_fd=target_dir_fd)
+            committed = True
+            if posix:
+                self._fsync_directory(directory)
+                self._verify_published(path, target_entry, target_dir_fd, written, opened)
         except BaseException:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
+            if not committed:
+                self._remove_if_same_file(temp_entry, temp_dir_fd, written)
             raise
-        if posix:
-            self._fsync_directory(directory)
+        finally:
+            handle.close()
 
     @staticmethod
-    def _resolve_config_target(path, posix):
-        """Return the file to replace, following a trusted final symlink."""
+    def _is_same_file(entry, dir_fd, expected):
         try:
-            link = os.lstat(path)
-        except FileNotFoundError:
-            return path
-        if not stat.S_ISLNK(link.st_mode):
-            return path
-        if posix and link.st_uid not in (os.geteuid(), 0):
+            current = os.lstat(entry, dir_fd=dir_fd)
+        except OSError:
+            return False
+        return (current.st_dev, current.st_ino) == (expected.st_dev, expected.st_ino)
+
+    def _remove_if_same_file(self, entry, dir_fd, expected):
+        """Remove the temporary file, but never an entry someone put in its place."""
+        if self._is_same_file(entry, dir_fd, expected):
+            try:
+                os.unlink(entry, dir_fd=dir_fd)
+            except OSError:
+                pass
+
+    def _verify_published(self, path, entry, dir_fd, written, opened):
+        """Fail if the rename did not publish our file where ``path`` points."""
+        if not self._is_same_file(entry, dir_fd, written):
             raise errors.GimmeAWSCredsError(
-                'Refusing to follow configuration symlink {}: owned by another user'.format(path))
-        try:
-            target = os.path.realpath(path, strict=True)
-        except OSError as exc:
-            raise errors.GimmeAWSCredsError(
-                'Refusing to follow configuration symlink {}: {}'.format(path, exc.strerror)) from exc
-        if not stat.S_ISREG(os.lstat(target).st_mode):
-            raise errors.GimmeAWSCredsError(
-                'Refusing to follow configuration symlink {}: target is not a regular file'.format(path))
-        return target
+                'Configuration file {} was changed by another process while it was '
+                'being written; check its contents'.format(path))
+        for directory_path, fd in opened:
+            try:
+                now = os.stat(directory_path)
+            except OSError:
+                now = None
+            pinned = os.fstat(fd)
+            if now is None or (now.st_dev, now.st_ino) != (pinned.st_dev, pinned.st_ino):
+                raise errors.GimmeAWSCredsError(
+                    'Configuration directory {} was moved or replaced while {} was being '
+                    'written; the new configuration is in the original directory'.format(
+                        directory_path, path))
 
     @staticmethod
     def _preserve_ownership(fd, existing, target):
@@ -603,26 +728,34 @@ class Config:
             return
         try:
             os.fchown(fd, existing.st_uid, existing.st_gid)
-        except PermissionError:
+        except PermissionError as exc:
             if created.st_uid != existing.st_uid:
-                raise errors.GimmeAWSCredsError(
-                    'Refusing to replace configuration file {}: it is owned by another user'.format(target))
-            # Same owner but the group cannot be kept; the 0600 mode means the
-            # group has no access either way.
+                reason = 'it is owned by another user'
+            else:
+                reason = 'its group (gid {}) cannot be kept'.format(existing.st_gid)
+            raise errors.GimmeAWSCredsError(
+                'Refusing to replace configuration file {}: {}'.format(target, reason)) from exc
 
     @staticmethod
     def _fsync_directory(directory):
         """Persist the rename; not every filesystem supports this."""
+        directory_path, fd = directory
+        if fd is not None:
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+            return
         try:
-            dir_fd = os.open(directory, os.O_RDONLY)
+            fd = os.open(directory_path, os.O_RDONLY)
         except OSError:
             return
         try:
-            os.fsync(dir_fd)
+            os.fsync(fd)
         except OSError:
             pass
         finally:
-            os.close(dir_fd)
+            os.close(fd)
 
     def _get_org_url_entry(self, default_entry):
         """ Get and validate okta_org_url """
