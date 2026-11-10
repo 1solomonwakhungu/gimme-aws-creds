@@ -11,7 +11,11 @@ See the License for the specific language governing permissions and* limitations
 """
 import argparse
 import configparser
+import io
 import os
+import secrets
+import stat
+
 import requests
 from urllib.parse import urlparse
 
@@ -437,8 +441,144 @@ class Config:
         config[self.conf_profile] = config_dict
 
         # write out the conf file
-        with open(self.OKTA_CONFIG, 'w') as configfile:
-            config.write(configfile)
+        buffer = io.StringIO()
+        config.write(buffer)
+        self._write_private_config(self.OKTA_CONFIG, buffer.getvalue())
+
+    # Owner read/write only: the config can hold an Okta device token.
+    _CONFIG_FILE_MODE = 0o600
+
+    def _write_private_config(self, path, data):
+        """Atomically create or replace ``path`` with owner-only permissions.
+
+        The data is written to a uniquely named temporary file in the
+        destination directory, created with O_EXCL (and O_NOFOLLOW where
+        available) and mode 0600, flushed to disk and then renamed over the
+        destination. Readers therefore see either the old or the new file,
+        never a partial one, and an interrupted write leaves the original
+        untouched.
+
+        * Group/other permission bits on an existing file are removed (with a
+          warning); owner bits are kept, so a rewrite never widens the mode.
+          A file that is not owner-writable is refused, as open() would.
+        * The existing owner and group are kept. If the owner cannot be kept
+          (only root may give a file away), the write is refused rather than
+          silently transferring ownership.
+        * If the path itself is a symlink, the regular file it points to is
+          replaced, provided the link is owned by the current user or root.
+          Dangling links, links owned by other users and links to anything
+          other than a regular file are refused. A symlink to a directory
+          earlier in the path, followed by '..', resolves as the kernel does;
+          the path is never normalized lexically.
+
+        Windows: the temporary file inherits the ACL of its directory (by
+        default the user profile, which is private) and ``os.chmod`` only
+        toggles the read-only flag, so POSIX modes and ownership are not
+        enforced there. Replacement fails if another process holds the
+        config open.
+        """
+        posix = os.name != 'nt'
+        target = self._resolve_config_target(path, posix)
+        directory, name = os.path.split(target)
+        if not name:
+            raise errors.GimmeAWSCredsError(
+                'Cannot write configuration file {}: not a file path'.format(path))
+        directory = directory or os.curdir
+
+        try:
+            existing = os.lstat(target)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and not stat.S_ISREG(existing.st_mode):
+            raise errors.GimmeAWSCredsError(
+                'Refusing to replace configuration file {}: not a regular file'.format(target))
+
+        mode = self._CONFIG_FILE_MODE
+        if existing is not None and posix:
+            current = stat.S_IMODE(existing.st_mode)
+            mode = current & self._CONFIG_FILE_MODE
+            if not mode & stat.S_IWUSR and os.geteuid() != 0:
+                raise errors.GimmeAWSCredsError(
+                    'Refusing to replace configuration file {}: it is read-only'.format(target))
+            if current & ~self._CONFIG_FILE_MODE:
+                self.ui.warning(
+                    'Configuration file {} had permissions {:04o}; restricting them to {:04o}.'.format(
+                        target, current, mode))
+
+        temp_name = os.path.join(directory, '.{}.{}.tmp'.format(name, secrets.token_hex(8)))
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                 | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
+        fd = os.open(temp_name, flags, self._CONFIG_FILE_MODE)
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                if posix:
+                    if existing is not None:
+                        self._preserve_ownership(handle.fileno(), existing, target)
+                    # Apply the mode explicitly: open() is subject to umask.
+                    os.fchmod(handle.fileno(), mode)
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, target)
+        except BaseException:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+        if posix:
+            self._fsync_directory(directory)
+
+    @staticmethod
+    def _resolve_config_target(path, posix):
+        """Return the file to replace, following a trusted final symlink."""
+        try:
+            link = os.lstat(path)
+        except FileNotFoundError:
+            return path
+        if not stat.S_ISLNK(link.st_mode):
+            return path
+        if posix and link.st_uid not in (os.geteuid(), 0):
+            raise errors.GimmeAWSCredsError(
+                'Refusing to follow configuration symlink {}: owned by another user'.format(path))
+        try:
+            target = os.path.realpath(path, strict=True)
+        except OSError as exc:
+            raise errors.GimmeAWSCredsError(
+                'Refusing to follow configuration symlink {}: {}'.format(path, exc.strerror)) from exc
+        if not stat.S_ISREG(os.lstat(target).st_mode):
+            raise errors.GimmeAWSCredsError(
+                'Refusing to follow configuration symlink {}: target is not a regular file'.format(path))
+        return target
+
+    @staticmethod
+    def _preserve_ownership(fd, existing, target):
+        """Give the replacement file the owner and group of the original."""
+        created = os.fstat(fd)
+        if (created.st_uid, created.st_gid) == (existing.st_uid, existing.st_gid):
+            return
+        try:
+            os.fchown(fd, existing.st_uid, existing.st_gid)
+        except PermissionError:
+            if created.st_uid != existing.st_uid:
+                raise errors.GimmeAWSCredsError(
+                    'Refusing to replace configuration file {}: it is owned by another user'.format(target))
+            # Same owner but the group cannot be kept; the 0600 mode means the
+            # group has no access either way.
+
+    @staticmethod
+    def _fsync_directory(directory):
+        """Persist the rename; not every filesystem supports this."""
+        try:
+            dir_fd = os.open(directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(dir_fd)
 
     def _get_org_url_entry(self, default_entry):
         """ Get and validate okta_org_url """
