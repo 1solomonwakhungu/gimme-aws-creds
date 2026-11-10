@@ -483,13 +483,15 @@ Writing to the AWS credentials file includes the `x_security_token_expires` valu
 
 ### Store Credentials from JSON
 
-`gimme-aws-creds --action-store-json-creds` stores JSON-formatted credentials read from `stdin` into the AWS credentials file. Example:
+`gimme-aws-creds --action-store-json-creds` stores JSON-formatted credentials read from `stdin` into the AWS credentials file (or the Alibaba Cloud config file for Alibaba Cloud credentials). Example:
 
 ```bash
 gimme-aws-creds -o json | gimme-aws-creds --action-store-json-creds
 ```
 
 Data can be modified by scripts in between.
+
+Each line is stored according to its `credentials.credentials_type` (`aws` or `alibaba_cloud`), regardless of whether the active profile enables Alibaba Cloud. Lines without `credentials_type`, as produced by releases before Alibaba Cloud support, are stored as AWS credentials. Credentials are written to the line's `shared_credentials_file`, or to the provider's default file if it is not set. Lines with missing fields, an unsupported `credentials_type`, or no `credentials_type` but Alibaba Cloud fields are skipped with a warning.
 
 ## Python API
 
@@ -527,8 +529,10 @@ for data in creds.iter_selected_aws_credentials():
         raise ValueError("Didn't find aws_account_id (12 digits) in {}".format(arn))
 
     data['profile']['name'] = 'okta-{}'.format(account_id)
-    creds.write_aws_creds_from_data(data)
+    creds.write_credentials_from_data(data)
 ```
+
+`write_credentials_from_data(data, credentials_file=None)` writes AWS and Alibaba Cloud credentials. `credentials_file` takes precedence over the record's `shared_credentials_file`. Scripts written for earlier releases can keep calling `write_aws_creds_from_data(data, aws_config=None)`; it stores AWS credentials only, gives `aws_config` the same precedence, and skips records of other types with a warning.
 
 ## Cloud Provider Support
 
