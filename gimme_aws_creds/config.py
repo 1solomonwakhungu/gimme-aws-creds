@@ -11,6 +11,7 @@ See the License for the specific language governing permissions and* limitations
 """
 import argparse
 import configparser
+import contextlib
 import errno
 import io
 import os
@@ -46,7 +47,14 @@ class _DarwinACL:
     _TYPE_EXTENDED = 0x00000100
     _FIRST_ENTRY = 0
     _NEXT_ENTRY = -1
+    _EXTENDED_ALLOW = 1
+    _EXTENDED_DENY = 2
     _ENTRY_INHERITED = 1 << 4
+    _ENTRY_ONLY_INHERIT = 1 << 8
+    # Directory rights that let a principal add, remove or rename entries
+    # (ACL_ADD_FILE, ACL_ADD_SUBDIRECTORY, ACL_DELETE_CHILD) or give itself
+    # those rights (ACL_WRITE_SECURITY, ACL_CHANGE_OWNER).
+    _CHANGE_ENTRIES = (1 << 2) | (1 << 5) | (1 << 6) | (1 << 12) | (1 << 13)
 
     def __init__(self):
         import ctypes
@@ -58,6 +66,8 @@ class _DarwinACL:
                 ('acl_set_fd_np', integer, [integer, pointer, integer]),
                 ('acl_init', pointer, [integer]),
                 ('acl_get_entry', integer, [pointer, integer, ctypes.POINTER(pointer)]),
+                ('acl_get_tag_type', integer, [pointer, ctypes.POINTER(integer)]),
+                ('acl_get_permset_mask_np', integer, [pointer, ctypes.POINTER(ctypes.c_uint64)]),
                 ('acl_get_flagset_np', integer, [pointer, ctypes.POINTER(pointer)]),
                 ('acl_get_flag_np', integer, [pointer, integer]),
                 ('acl_free', integer, [pointer])):
@@ -67,34 +77,73 @@ class _DarwinACL:
         self._lib = lib
 
     def _error(self):
-        code = self._ctypes.get_errno()
+        code = self._ctypes.get_errno() or errno.EIO
         return OSError(code, os.strerror(code))
 
-    def entries(self, fd):
-        """Return one flag per ACL entry of ``fd``: whether it was inherited."""
+    def _each_entry(self, fd):
+        """Yield the ACL entries of ``fd``; none if it has no extended ACL."""
         ctypes, lib = self._ctypes, self._lib
         ctypes.set_errno(0)
         acl = lib.acl_get_fd_np(fd, self._TYPE_EXTENDED)
         if not acl:
             if ctypes.get_errno() == errno.ENOENT:
-                return []  # the file has no extended ACL
+                return  # the file has no extended ACL
             raise self._error()
         try:
-            inherited = []
-            entry, flagset = ctypes.c_void_p(), ctypes.c_void_p()
+            entry = ctypes.c_void_p()
             which = self._FIRST_ENTRY
-            # acl_get_entry() fails (EINVAL) after the last entry.
-            while lib.acl_get_entry(acl, which, ctypes.byref(entry)) == 0:
+            while True:
+                ctypes.set_errno(0)
+                if lib.acl_get_entry(acl, which, ctypes.byref(entry)) != 0:
+                    # acl_get_entry() fails with EINVAL after the last entry.
+                    if ctypes.get_errno() == errno.EINVAL:
+                        return
+                    raise self._error()
                 which = self._NEXT_ENTRY
-                if lib.acl_get_flagset_np(entry, ctypes.byref(flagset)) != 0:
-                    raise self._error()
-                flag = lib.acl_get_flag_np(flagset, self._ENTRY_INHERITED)
-                if flag < 0:
-                    raise self._error()
-                inherited.append(bool(flag))
-            return inherited
+                yield entry
         finally:
             lib.acl_free(acl)
+
+    def _has_flag(self, entry, flag):
+        ctypes, lib = self._ctypes, self._lib
+        flagset = ctypes.c_void_p()
+        if lib.acl_get_flagset_np(entry, ctypes.byref(flagset)) != 0:
+            raise self._error()
+        value = lib.acl_get_flag_np(flagset, flag)
+        if value < 0:
+            raise self._error()
+        return bool(value)
+
+    def entries(self, fd):
+        """Return one flag per ACL entry of ``fd``: whether it was inherited."""
+        with contextlib.closing(self._each_entry(fd)) as each:
+            return [self._has_flag(entry, self._ENTRY_INHERITED) for entry in each]
+
+    def may_change_entries(self, fd):
+        """Whether an ACL entry of directory ``fd`` lets anyone change its entries.
+
+        Allow entries that apply to the directory itself and grant a right in
+        _CHANGE_ENTRIES count, whoever they name; so does an entry of an
+        unknown kind. Deny entries and inherit-only entries do not.
+        """
+        ctypes, lib = self._ctypes, self._lib
+        with contextlib.closing(self._each_entry(fd)) as each:
+            for entry in each:
+                tag = ctypes.c_int()
+                if lib.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                    raise self._error()
+                if tag.value == self._EXTENDED_DENY:
+                    continue
+                if tag.value != self._EXTENDED_ALLOW:
+                    return True
+                if self._has_flag(entry, self._ENTRY_ONLY_INHERIT):
+                    continue
+                rights = ctypes.c_uint64()
+                if lib.acl_get_permset_mask_np(entry, ctypes.byref(rights)) != 0:
+                    raise self._error()
+                if rights.value & self._CHANGE_ENTRIES:
+                    return True
+        return False
 
     def clear(self, fd):
         """Replace the extended ACL of ``fd`` with an empty one."""
@@ -633,13 +682,25 @@ class Config:
 
         Threat model (POSIX). Every directory involved is opened once and
         later operations are relative to those descriptors, so renaming or
-        replacing a parent directory cannot redirect the write. Another user
-        who can write to the destination directory can rename the staging
-        directory or put something else under its name, but cannot add,
-        remove or replace entries inside it, so the file that is renamed into
-        place is always the one this process wrote. A substituted staging
-        directory (not a directory, not owned by the current user, not
-        private, or not empty) is refused before anything is written.
+        replacing a parent directory cannot redirect the write.
+
+        The directory that will hold the file (after following symlinks) must
+        be owned by the current user or root, have no group or other write
+        bit, and have no ACL entry that lets anyone add, remove or rename its
+        entries or change its ACL or owner. Otherwise the write is refused
+        before anything is created, and nothing in that directory, including
+        its ACL, is changed. A shared or world-writable directory (even with
+        the sticky bit) is therefore not a supported configuration location;
+        the default and XDG locations are private directories.
+
+        Within such a directory only this user and root can put an entry
+        under a name, so the staging directory this process creates cannot
+        be swapped for another directory, and the file renamed into place is
+        always the one this process wrote. Cleanup removes only the staging
+        directory and file this process created, checked by identity first.
+        A staging directory that is not a directory, not owned by the
+        current user, not private or not empty when checked (which only the
+        same user or root could cause) is refused and left alone.
 
         ACLs. A new directory can inherit ACL entries from its parent that
         grant other users access its 0700 mode does not show, so the staging
@@ -653,11 +714,15 @@ class Config:
           are refused by the checks that follow. A directory with entries that
           were not inherited is not the one just made, so it is refused and
           its ACL left alone. ACLs of the destination and its directories are
-          never changed.
+          only read, never changed; inherit-only entries of the destination
+          directory, which do not apply to it, are what the staging directory
+          can inherit.
         * Linux: POSIX.1e ACL entries for named users and groups are limited
-          by the ACL mask, which is the group mode bits, and those are zero.
-          NFSv4 ACLs (system.nfs4_acl) are not limited that way and are
-          refused.
+          by the ACL mask, which is the group mode bits: without the group
+          write bit nobody they name can change the destination directory,
+          and the staging directory's group bits are zero. NFSv4 ACLs
+          (system.nfs4_acl) are not limited that way and are refused on
+          either directory.
         * Other POSIX systems: refused, as their ACLs cannot be checked.
 
         The staged file's mode and ACL are checked before anything is written
@@ -667,10 +732,10 @@ class Config:
         change anything this process can; network filesystems whose server
         grants access the local modes and ACLs do not show; and filesystems
         that do not enforce POSIX ownership and modes. A link is refused if it
-        changes while it is read, but once the destination entry is chosen
-        another user who can write to its directory can still replace that
-        entry, so success means the new
-        file was published where the path pointed when it was resolved. The
+        changes while it is read. Another user who can write to a directory
+        earlier in the path can still change what the path resolves to
+        before it is opened, so success means the new file was published
+        where the path pointed when it was resolved. The
         write fails, after publishing, if the published file or a pinned
         directory no longer matches. POSIX systems without the descriptor
         functions this needs are refused rather than written insecurely.
@@ -693,6 +758,8 @@ class Config:
         opened = []
         try:
             directory, name, existing = self._locate_config_target(path, posix, pinned, opened)
+            if posix:
+                self._require_trusted_directory(path, directory)
             self._replace_config(path, directory, name, existing, data, posix, opened)
         finally:
             for _, fd in opened:
@@ -849,21 +916,26 @@ class Config:
                 return (stat.S_ISDIR(st.st_mode) and st.st_uid == os.geteuid()
                         and not stat.S_IMODE(st.st_mode) & 0o077 and not os.listdir(fd))
 
-            # mkdir() made it 0700 (less any umask bits), so group/other bits,
-            # another owner or existing entries mean this is not that directory.
+            # Only this user and root can add or rename entries in the
+            # destination directory (_require_trusted_directory), so the
+            # name mkdir() just created refers to that directory or, if an
+            # inherited ACL let someone move it out, to nothing; nobody else
+            # can put another directory there. These checks guard against the
+            # same user or root, which are outside the threat model: mkdir()
+            # made it 0700 (less any umask bits), so group/other bits,
+            # another owner or existing entries mean this is not that
+            # directory, and it is left alone.
             if not private_and_empty():
                 raise refuse()
-            # From here on it is our directory (with the explicit-entry
-            # exception below), so a failure removes it.
             ours = True
             if not self._drop_inherited_acl(path, display, fd):
-                # A new directory only has inherited ACL entries: this one was
-                # put in its place, and neither it nor its ACL is ours.
+                # A new directory only has inherited ACL entries.
                 ours = False
                 raise refuse()
             # Until the inherited ACL was removed, the principals it named
-            # could add entries here or move the directory; they no longer
-            # can, and anything they did is caught now.
+            # could add entries here or move the directory out of the
+            # destination directory; they no longer can, and anything they
+            # did is caught now.
             if not private_and_empty() or not self._is_same_file(entry, dir_fd, os.fstat(fd)):
                 raise refuse()
             if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
@@ -882,6 +954,41 @@ class Config:
             self._discard_new_staging_directory(entry, dir_fd, fd)
             raise
         return display, fd
+
+    def _require_trusted_directory(self, path, directory):
+        """Refuse a destination directory whose entries other users can change.
+
+        Only its owner, if that is this user or root, may add, remove or
+        rename its entries: no group or other write bit, and no ACL entry
+        that grants those rights or the right to change the ACL or owner.
+        Nothing is created or changed before this check passes.
+        """
+        directory_path, fd = directory
+
+        def refuse(reason):
+            return errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: its directory {} {}'.format(
+                    path, directory_path, reason))
+
+        st = os.fstat(fd)
+        if st.st_uid not in (os.geteuid(), 0):
+            raise refuse('is owned by another user')
+        if stat.S_IMODE(st.st_mode) & 0o022:
+            raise refuse('is writable by other users (remove that with chmod go-w)')
+        try:
+            if _ACL_POLICY == 'darwin':
+                shared = _darwin_acl_api().may_change_entries(fd)
+            else:
+                # POSIX.1e ACLs: the group bits, checked above, are the mask
+                # that limits every named user and group entry. NFSv4 ACLs
+                # are not limited by the mode.
+                shared = self._has_nfs4_acl(fd)
+        except OSError as exc:
+            raise refuse('has an access control list that cannot be checked ({})'.format(
+                exc.strerror)) from exc
+        if shared:
+            raise refuse('has an access control list that may let other users add or '
+                          'remove entries')
 
     def _require_acl_support(self, path):
         """Refuse platforms where ACLs on the staging directory cannot be ruled out."""
