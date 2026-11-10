@@ -26,7 +26,9 @@ from .common import user_agent
 # Whether the config writer can pin directories with descriptors. os.replace()
 # and os.rename() share renameat(), but only os.rename is listed in
 # supports_dir_fd, so test that rather than os.replace.
-_DIR_FD_SUPPORTED = {os.open, os.lstat, os.readlink, os.rename, os.unlink} <= os.supports_dir_fd
+_DIR_FD_SUPPORTED = (
+    {os.open, os.lstat, os.readlink, os.rename, os.unlink, os.mkdir, os.rmdir} <= os.supports_dir_fd
+    and os.listdir in os.supports_fd)
 
 
 class Config:
@@ -506,13 +508,15 @@ class Config:
     def _write_private_config(self, path, data):
         """Atomically create or replace ``path`` with owner-only permissions.
 
-        The data is written to a uniquely named temporary file in the
-        destination directory, created with O_EXCL (and O_NOFOLLOW where
-        available) and mode 0600, flushed to disk and then renamed over the
-        destination. Readers see either the old or the new file, never a
-        partial one. An error raised before the rename leaves the original
-        untouched and removes the temporary file; a crash can leave the
-        temporary file behind.
+        The data is written to a file with a fixed name inside a new staging
+        directory, which is created next to the destination with mode 0700,
+        opened once, and checked to be an empty directory owned by the current
+        user with no group or other permissions. The file is created with
+        O_EXCL and O_NOFOLLOW and mode 0600, flushed to disk and renamed over
+        the destination relative to the staging directory's descriptor.
+        Readers see either the old or the new file, never a partial one. An
+        error raised before the rename leaves the original untouched and
+        removes the staged file and directory; a crash can leave them behind.
 
         * Group/other permission bits on an existing file are removed (with a
           warning); owner bits are kept, so a rewrite never widens the mode.
@@ -527,23 +531,40 @@ class Config:
           earlier in the path, followed by '..', resolves as the kernel does;
           the path is never normalized lexically.
 
-        On POSIX systems every directory involved is opened once and all
-        later operations are relative to that descriptor, so renaming or
-        replacing a parent directory cannot redirect the write. A link is
-        refused if it changes while it is being read, the temporary file must
-        still be the one written when it is renamed, and the write fails if
-        the published file or any directory used no longer matches afterwards.
-        These checks detect, but cannot prevent, another user who can modify
-        a directory on the path from changing it after the rename.
+        Threat model (POSIX). Every directory involved is opened once and
+        later operations are relative to those descriptors, so renaming or
+        replacing a parent directory cannot redirect the write. Another user
+        who can write to the destination directory can rename the staging
+        directory or put something else under its name, but cannot add,
+        remove or replace entries inside it, so the file that is renamed into
+        place is always the one this process wrote. A substituted staging
+        directory (not a directory, not owned by the current user, not
+        private, or not empty) is refused before anything is written.
+
+        Not covered: processes running as the same user or as root, which can
+        change anything this process can; access granted through ACLs, which
+        are not inspected; and filesystems that do not enforce POSIX
+        ownership and modes. A link is refused if it changes while it is read,
+        but once the destination entry is chosen another user who can write to
+        its directory can still replace that entry, so success means the new
+        file was published where the path pointed when it was resolved. The
+        write fails, after publishing, if the published file or a pinned
+        directory no longer matches. POSIX systems without the descriptor
+        functions this needs are refused rather than written insecurely.
 
         Windows: directory descriptors are not available, so the path is
-        resolved by name. The temporary file inherits the ACL of its directory
-        (by default the user profile, which is private) and ``os.chmod`` only
-        toggles the read-only flag, so POSIX modes and ownership are not
-        enforced there.
+        resolved by name and none of the guarantees above are claimed. The
+        staging directory and file inherit the ACL of the destination
+        directory (by default the user profile, which is private) and
+        ``os.chmod`` only toggles the read-only flag, so POSIX modes and
+        ownership are not enforced there.
         """
         posix = os.name != 'nt'
-        pinned = posix and _DIR_FD_SUPPORTED
+        if posix and not _DIR_FD_SUPPORTED:
+            raise errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: this platform cannot open '
+                'directories safely'.format(path))
+        pinned = posix
         opened = []
         try:
             directory, name, existing = self._locate_config_target(path, posix, pinned, opened)
@@ -635,8 +656,12 @@ class Config:
     def _link_identity(st):
         return st.st_dev, st.st_ino, st.st_uid, st.st_ctime_ns, st.st_mode
 
+    # Name of the file inside the private staging directory. It is fixed:
+    # nobody else can create entries there.
+    _STAGED_FILE_NAME = 'config'
+
     def _replace_config(self, path, directory, name, existing, data, posix, opened):
-        """Write ``data`` to a temporary file in ``directory`` and rename it."""
+        """Write ``data`` in a private staging directory and rename it to ``name``."""
         mode = self._CONFIG_FILE_MODE
         if existing is not None and posix:
             current = stat.S_IMODE(existing.st_mode)
@@ -649,8 +674,105 @@ class Config:
                     'Configuration file {} had permissions {:04o}; restricting them to {:04o}.'.format(
                         path, current, mode))
 
-        temp = '.{}.{}.tmp'.format(name[:self._TEMP_NAME_PREFIX], secrets.token_hex(8))
-        temp_entry, temp_dir_fd = self._at(directory, temp)
+        stage_name = '.{}.{}.tmp'.format(name[:self._TEMP_NAME_PREFIX], secrets.token_hex(8))
+        stage = None
+        try:
+            stage = self._create_staging_directory(path, directory, stage_name, posix)
+            self._publish_staged(path, directory, name, stage, existing, mode, data, posix, opened)
+        finally:
+            if stage is not None:
+                self._remove_staging_directory(directory, stage_name, stage)
+
+    def _create_staging_directory(self, path, directory, stage_name, posix):
+        """Create the private staging directory and return it pinned.
+
+        Returns ``(display_path, fd)``; ``fd`` is None on Windows.
+        """
+        entry, dir_fd = self._at(directory, stage_name)
+        display = os.path.join(directory[0], stage_name)
+        try:
+            os.mkdir(entry, 0o700, dir_fd=dir_fd)
+        except FileExistsError:
+            raise  # the name belongs to someone else
+        except BaseException:
+            # mkdir() may have succeeded before an interrupt was delivered.
+            self._discard_new_staging_directory(entry, dir_fd, None)
+            raise
+        if not posix:
+            return display, None
+
+        def refuse():
+            return errors.GimmeAWSCredsError(
+                'Refusing to write configuration file {}: its staging directory {} was '
+                'replaced by another process'.format(path, display))
+
+        flags = (os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | os.O_NOFOLLOW
+                 | getattr(os, 'O_CLOEXEC', 0))
+        fd = None
+        try:
+            try:
+                fd = os.open(entry, flags, dir_fd=dir_fd)
+            except OSError as exc:
+                # A symlink or non-directory now has the name we created.
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT):
+                    raise refuse() from exc
+                raise
+            st = os.fstat(fd)
+            # mkdir() made it 0700 (less any umask bits), so group/other bits,
+            # another owner or existing entries mean this is not that directory.
+            if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
+                    or stat.S_IMODE(st.st_mode) & 0o077 or os.listdir(fd)):
+                raise refuse()
+            if stat.S_IMODE(st.st_mode) != 0o700:
+                # The umask removed owner bits this process needs.
+                os.fchmod(fd, 0o700)
+        except errors.GimmeAWSCredsError:
+            # Whatever is there now is not ours to remove.
+            if fd is not None:
+                os.close(fd)
+            raise
+        except BaseException:
+            # Failed or interrupted while checking the directory just made.
+            self._discard_new_staging_directory(entry, dir_fd, fd)
+            raise
+        return display, fd
+
+    @staticmethod
+    def _discard_new_staging_directory(entry, dir_fd, fd):
+        """Best-effort removal of a staging directory that was never used."""
+        try:
+            current = os.lstat(entry, dir_fd=dir_fd)
+            if fd is not None:
+                pinned = os.fstat(fd)
+                ours = (current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino)
+            elif os.name != 'nt':
+                ours = stat.S_ISDIR(current.st_mode) and current.st_uid == os.geteuid()
+            else:
+                ours = stat.S_ISDIR(current.st_mode)
+            if ours:
+                os.rmdir(entry, dir_fd=dir_fd)
+        except OSError:
+            pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _remove_staging_directory(self, directory, stage_name, stage):
+        """Remove the staging directory if its name still refers to it."""
+        _, stage_fd = stage
+        entry, dir_fd = self._at(directory, stage_name)
+        try:
+            if stage_fd is None or self._is_same_file(entry, dir_fd, os.fstat(stage_fd)):
+                os.rmdir(entry, dir_fd=dir_fd)
+        except OSError:
+            pass
+        finally:
+            if stage_fd is not None:
+                os.close(stage_fd)
+
+    def _publish_staged(self, path, directory, name, stage, existing, mode, data, posix, opened):
+        """Write the staged file and rename it over the destination."""
+        temp_entry, temp_dir_fd = self._at(stage, self._STAGED_FILE_NAME)
         target_entry, target_dir_fd = self._at(directory, name)
         flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
                  | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_CLOEXEC', 0))
@@ -667,9 +789,10 @@ class Config:
             handle.flush()
             os.fsync(handle.fileno())
             if not posix:
-                # Windows cannot rename a file that is still open.
+                # Windows does not allow renaming this file while it is open.
                 handle.close()
-            # On POSIX the handle stays open, so the inode cannot be reused.
+            # Only the same user or root can reach inside the staging directory;
+            # this catches such a change made before the rename, not during it.
             if posix and not self._is_same_file(temp_entry, temp_dir_fd, written):
                 raise errors.GimmeAWSCredsError(
                     'Refusing to replace configuration file {}: the temporary file was '

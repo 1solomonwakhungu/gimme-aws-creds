@@ -12,6 +12,8 @@ from tests.user_interface_mock import MockUserInterface
 
 POSIX = os.name != 'nt'
 IS_ROOT = POSIX and os.geteuid() == 0
+# The fixed name of the file inside the writer's private staging directory.
+STAGED_FILE_NAME = 'config'
 
 
 def file_mode(path):
@@ -151,6 +153,31 @@ class AtomicConfigWriteTest(unittest.TestCase):
                     self.assertEqual(self.path.read_text(), original)
                     self.assertEqual(self.leftovers(), [])
 
+    @unittest.skipUnless(POSIX, 'POSIX directory descriptors')
+    def test_failure_while_checking_staging_directory_cleans_up(self):
+        original = '[DEFAULT]\nclient_id = original\n'
+        real_mkdir = os.mkdir
+        calls = []
+        for failure in (KeyboardInterrupt(), OSError(5, 'Input/output error')):
+            def after_mkdir(*args, **kwargs):
+                # The directory exists, but the call is interrupted on return.
+                real_mkdir(*args, **kwargs)
+                if kwargs.get('dir_fd') is not None:  # only the staging directory
+                    calls.append(args[0])
+                    raise failure
+
+            for target, effect in (('gimme_aws_creds.config.os.listdir', failure),
+                                   ('gimme_aws_creds.config.os.mkdir', after_mkdir)):
+                with self.subTest(failure=type(failure).__name__, at=target):
+                    self.path.write_text(original)
+                    expected = KeyboardInterrupt if isinstance(failure, KeyboardInterrupt) else GimmeAWSCredsError
+                    with patch(target, side_effect=effect):
+                        with self.assertRaises(expected):
+                            self.write('partial')
+                    self.assertEqual(self.path.read_text(), original)
+                    self.assertEqual(self.leftovers(), [])
+        self.assertEqual(len(calls), 2)
+
     def test_new_file_not_created_when_interrupted(self):
         with patch('gimme_aws_creds.config.os.replace', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
@@ -231,10 +258,26 @@ class AtomicConfigWriteTest(unittest.TestCase):
     def temp_entries(self, directory):
         return [p for p in directory.iterdir() if p.name.endswith('.tmp')]
 
+    def staging_entry(self, directory):
+        (entry,) = self.temp_entries(directory)
+        return entry
+
+    def plant(self, entry, kind, victim):
+        """Put an attacker entry of ``kind`` at ``entry`` (synthetic bytes)."""
+        if kind == 'regular':
+            entry.write_text('[DEFAULT]\nclient_id = ATTACKER\n')
+            os.chmod(entry, 0o644)
+        elif kind == 'symlink':
+            entry.symlink_to(victim)
+        else:
+            entry.mkdir()
+            (entry / STAGED_FILE_NAME).write_text('[DEFAULT]\nclient_id = ATTACKER\n')
+            os.chmod(entry / STAGED_FILE_NAME, 0o644)
+
     @unittest.skipUnless(POSIX, 'POSIX directory descriptors')
     def test_parent_directory_swap_cannot_redirect_write(self):
         # Another process renames the parent away and recreates it with its
-        # own file under the temporary name just before the rename.
+        # own entry under the staging name just before the rename.
         live = self.home / 'live'
         live.mkdir()
         path = live / 'config'
@@ -242,13 +285,14 @@ class AtomicConfigWriteTest(unittest.TestCase):
         os.chmod(path, 0o600)
         parked = self.home / 'parked'
         real_replace = os.replace
+        planted = []
 
         def swap_parent(src, dst, *args, **kwargs):
             live.rename(parked)
             live.mkdir()
-            planted = live / os.path.basename(src)
-            planted.write_text('[DEFAULT]\nclient_id = attacker\n')
-            os.chmod(planted, 0o644)
+            entry = live / self.staging_entry(parked).name
+            self.plant(entry, 'directory', None)
+            planted.append(entry)
             return real_replace(src, dst, *args, **kwargs)
 
         with patch('gimme_aws_creds.config.os.replace', side_effect=swap_parent):
@@ -258,9 +302,173 @@ class AtomicConfigWriteTest(unittest.TestCase):
         self.assertIn('new', (parked / 'config').read_text())
         self.assertEqual(file_mode(parked / 'config'), 0o600)
         self.assertEqual(self.temp_entries(parked), [])
+        # The attacker's entry is neither published nor removed.
+        self.assertIn('ATTACKER', (planted[0] / STAGED_FILE_NAME).read_text())
+
+    @unittest.skipUnless(POSIX, 'POSIX directory descriptors')
+    def test_public_staging_entry_swapped_at_rename_is_never_published(self):
+        # Threat boundary: another (lower-privileged) user who can write to the
+        # destination directory. The only entry they can touch there is the
+        # staging directory's name; they move it away and plant a 0644 file,
+        # a symlink or their own directory in its place immediately before the
+        # rename. The rename must still publish exactly the file written here.
+        for kind in ('regular', 'symlink', 'directory'):
+            with self.subTest(planted=kind):
+                home = self.home / kind
+                home.mkdir()
+                path = home / 'config'
+                path.write_text('[DEFAULT]\nclient_id = original\n')
+                os.chmod(path, 0o600)
+                victim = home / 'victim'
+                victim.write_text('victim data')
+                moved = home / 'moved'
+                real_replace = os.replace
+                at_commit = {}
+
+                def swap(src, dst, *args, **kwargs):
+                    entry = self.staging_entry(home)
+                    os.rename(entry, moved)
+                    self.plant(entry, kind, victim)
+                    result = real_replace(src, dst, *args, **kwargs)
+                    # Observe the writer's own rename before any later check.
+                    at_commit.update(link=path.is_symlink(), text=path.read_text(),
+                                     mode=file_mode(path))
+                    return result
+
+                outcome = None
+                with patch('gimme_aws_creds.config.os.replace', side_effect=swap):
+                    try:
+                        self.write('new', path=path)
+                    except GimmeAWSCredsError as exc:
+                        outcome = exc
+                # What the writer's own rename published, whatever it reports.
+                self.assertFalse(at_commit['link'], outcome)
+                self.assertNotIn('ATTACKER', at_commit['text'])
+                self.assertNotIn('victim', at_commit['text'])
+                self.assertIn('new', at_commit['text'])
+                self.assertEqual(at_commit['mode'], 0o600)
+                self.assertIsNone(outcome)
+                self.assertFalse(path.is_symlink())
+                self.assertIn('new', path.read_text())
+                self.assertEqual(victim.read_text(), 'victim data')
+                # The moved staging directory is now empty; the planted entry is
+                # someone else's and is left alone.
+                self.assertEqual(list(moved.iterdir()), [])
+                self.assertTrue(os.path.lexists(self.staging_entry(home)))
+
+    @unittest.skipUnless(POSIX, 'POSIX directory descriptors')
+    def test_substituted_staging_directory_is_refused(self):
+        # Another user replaces the staging directory between mkdir() and
+        # open(). Only directories private to this user and empty are used.
+        original = '[DEFAULT]\nclient_id = original\n'
+        decoy = self.home / 'decoy'
+        real_mkdir = os.mkdir
+        real_euid = os.geteuid()
+        cases = ('symlink', 'regular', 'group_writable', 'not_empty', 'foreign_owner')
+        for kind in cases:
+            with self.subTest(planted=kind):
+                self.path.write_text(original)
+                os.chmod(self.path, 0o600)
+                if decoy.exists():
+                    for child in decoy.iterdir():
+                        child.unlink()
+                    decoy.rmdir()
+                decoy.mkdir(mode=0o700)
+
+                def substitute(entry, *args, **kwargs):
+                    real_mkdir(entry, *args, **kwargs)
+                    if kwargs.get('dir_fd') is None:
+                        return  # not the writer's staging directory
+                    staged = self.home / entry
+                    staged.rmdir()
+                    if kind == 'symlink':
+                        staged.symlink_to(decoy, target_is_directory=True)
+                    elif kind == 'regular':
+                        staged.write_text('[DEFAULT]\nclient_id = ATTACKER\n')
+                    else:
+                        real_mkdir(staged, 0o700)
+                        if kind == 'group_writable':
+                            os.chmod(staged, 0o770)
+                        elif kind == 'not_empty':
+                            (staged / 'planted').write_text('ATTACKER')
+
+                # 'foreign_owner': the planted directory belongs to this test's
+                # uid, so the writer is told it runs as another uid instead.
+                euid = real_euid + 1 if kind == 'foreign_owner' else real_euid
+                with patch('gimme_aws_creds.config.os.mkdir', side_effect=substitute), \
+                        patch('gimme_aws_creds.config.os.geteuid', return_value=euid):
+                    with self.assertRaisesRegex(GimmeAWSCredsError, 'staging directory .* replaced'):
+                        self.write('new')
+                self.assertFalse(self.path.is_symlink())
+                self.assertEqual(self.path.read_text(), original)
+                self.assertEqual(file_mode(self.path), 0o600)
+                self.assertEqual(list(decoy.iterdir()), [])
+                for entry in self.temp_entries(self.home):
+                    if entry.is_dir() and not entry.is_symlink():
+                        for child in entry.iterdir():
+                            child.unlink()
+                        entry.rmdir()
+                    else:
+                        entry.unlink()
+
+    @unittest.skipUnless(POSIX, 'POSIX directory descriptors')
+    def test_staged_file_is_written_and_renamed_through_private_directory_fd(self):
+        real_open = os.open
+        real_replace = os.replace
+        for mask in (0o000, 0o022, 0o077, 0o277):
+            with self.subTest(umask=oct(mask)):
+                staged = []
+                renamed = []
+
+                def record_open(entry, flags, *args, dir_fd=None, **kwargs):
+                    if flags & os.O_CREAT:
+                        directory = os.fstat(dir_fd) if dir_fd is not None else None
+                        contents = os.listdir(dir_fd) if dir_fd is not None else None
+                        staged.append((entry, dir_fd, directory, contents))
+                    return real_open(entry, flags, *args, dir_fd=dir_fd, **kwargs)
+
+                def record_replace(src, dst, *args, **kwargs):
+                    renamed.append((src, kwargs.get('src_dir_fd'), os.fstat(kwargs['src_dir_fd'])))
+                    return real_replace(src, dst, *args, **kwargs)
+
+                previous = os.umask(mask)
+                try:
+                    with patch('gimme_aws_creds.config.os.open', side_effect=record_open), \
+                            patch('gimme_aws_creds.config.os.replace', side_effect=record_replace):
+                        self.write('new')
+                finally:
+                    os.umask(previous)
+                self.assertEqual(Config._STAGED_FILE_NAME, STAGED_FILE_NAME)
+                ((entry, dir_fd, directory, contents),) = staged
+                self.assertEqual(entry, STAGED_FILE_NAME)
+                self.assertIsNotNone(dir_fd)
+                self.assertTrue(stat.S_ISDIR(directory.st_mode))
+                self.assertEqual(directory.st_uid, os.geteuid())
+                self.assertEqual(stat.S_IMODE(directory.st_mode), 0o700)
+                self.assertEqual(contents, [])
+                ((src, src_dir_fd, src_directory),) = renamed
+                self.assertEqual(src, STAGED_FILE_NAME)
+                self.assertEqual((src_directory.st_dev, src_directory.st_ino),
+                                 (directory.st_dev, directory.st_ino))
+                self.assertIn('new', self.path.read_text())
+                self.assertEqual(file_mode(self.path), 0o600)
+                self.assertEqual(self.leftovers(), [])
+
+    @unittest.skipUnless(POSIX, 'POSIX')
+    def test_posix_without_directory_descriptors_is_refused(self):
+        original = '[DEFAULT]\nclient_id = original\n'
+        self.path.write_text(original)
+        with patch('gimme_aws_creds.config._DIR_FD_SUPPORTED', False):
+            with self.assertRaisesRegex(GimmeAWSCredsError, 'cannot open directories safely'):
+                self.write('new')
+        self.assertEqual(self.path.read_text(), original)
+        self.assertEqual(self.leftovers(), [])
 
     @unittest.skipUnless(POSIX, 'POSIX symlinks')
-    def test_temp_entry_swapped_before_rename_is_refused(self):
+    def test_same_user_change_inside_staging_directory_is_refused_before_rename(self):
+        # Outside the threat boundary: only this user (or root) can change the
+        # private staging directory. A change made before the final check is
+        # still refused; one made during the rename cannot be prevented.
         original = '[DEFAULT]\nclient_id = original\n'
         self.path.write_text(original)
         os.chmod(self.path, 0o600)
@@ -272,7 +480,7 @@ class AtomicConfigWriteTest(unittest.TestCase):
         def swap_temp(fd):
             real_fsync(fd)
             if not planted:
-                (entry,) = self.temp_entries(self.home)
+                entry = self.staging_entry(self.home) / STAGED_FILE_NAME
                 entry.unlink()
                 entry.symlink_to(victim)
                 planted.append(entry)
@@ -285,26 +493,6 @@ class AtomicConfigWriteTest(unittest.TestCase):
         self.assertEqual(victim.read_text(), 'victim data')
         # Someone else's entry is not ours to delete.
         self.assertTrue(planted[0].is_symlink())
-
-    @unittest.skipUnless(POSIX, 'POSIX symlinks')
-    def test_temp_entry_swapped_at_rename_is_reported(self):
-        # Publication cannot be prevented here; the write must not succeed.
-        self.path.write_text('[DEFAULT]\nclient_id = original\n')
-        os.chmod(self.path, 0o600)
-        victim = self.home / 'victim'
-        victim.write_text('victim data')
-        real_replace = os.replace
-
-        def swap_temp(src, dst, *args, **kwargs):
-            entry = self.home / os.path.basename(src)
-            entry.unlink()
-            entry.symlink_to(victim)
-            return real_replace(src, dst, *args, **kwargs)
-
-        with patch('gimme_aws_creds.config.os.replace', side_effect=swap_temp):
-            with self.assertRaisesRegex(GimmeAWSCredsError, 'changed by another process'):
-                self.write('new')
-        self.assertEqual(victim.read_text(), 'victim data')
 
     def final_link_fixture(self):
         intended = self.home / 'intended'
