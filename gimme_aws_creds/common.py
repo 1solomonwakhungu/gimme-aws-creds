@@ -129,6 +129,8 @@ def _check_saml_xml_structure(xml_bytes):
         parser.Parse(xml_bytes, True)
     except _SamlXmlRejected as exc:
         raise SamlAssertionError(str(exc)) from None
+    except (LookupError, ValueError):
+        raise SamlAssertionError('unsupported XML encoding') from None
     except xml.parsers.expat.ExpatError as exc:
         raise SamlAssertionError('malformed XML ({})'.format(
             xml.parsers.expat.ErrorString(exc.code))) from None
@@ -157,8 +159,10 @@ def parse_saml_role_attributes(assertion_b64, attribute_name):
     try:
         # DTDs and entity declarations were refused above, so expansion cannot occur here.
         root = ET.fromstring(xml_bytes)  # nosec B314
-    except ET.ParseError as exc:
-        raise SamlAssertionError('malformed XML ({})'.format(exc)) from None
+    except (LookupError, ValueError):
+        raise SamlAssertionError('unsupported XML encoding') from None
+    except ET.ParseError:
+        raise SamlAssertionError('malformed XML') from None
     return _iter_saml_attribute_values(root, attribute_name)
 
 

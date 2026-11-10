@@ -160,6 +160,21 @@ class TestRejectedAssertions(unittest.TestCase):
         self.assertRejected(b64('<a><b></a>'), 'malformed XML')
         self.assertRejected(b64('<saml2:a>unbound prefix</saml2:a>'), 'malformed XML')
 
+    def test_unsupported_xml_encodings_are_safe_cli_errors(self):
+        for encoding in ('x-SECRET-MARKER', 'shift_jis', 'utf-7', 'utf-32', 'base64'):
+            with self.subTest(encoding=encoding):
+                doc = '<?xml version="1.0" encoding="{}"?><r/>'.format(encoding)
+                exc = self.assertRejected(b64(doc), 'unsupported XML encoding')
+                self.assertNotIn(encoding, exc.message)
+                self.assertIsInstance(exc, errors.GimmeAWSCredsError)
+
+    def test_second_parser_encoding_errors_are_normalized(self):
+        for error in (LookupError('SECRET-MARKER'), ValueError('SECRET-MARKER')):
+            with self.subTest(error=type(error)):
+                with mock.patch.object(common.ET, 'fromstring', side_effect=error):
+                    exc = self.assertRejected(b64(VALID_RESPONSE), 'unsupported XML encoding')
+                self.assertNotIn('SECRET-MARKER', exc.message)
+
     def test_undeclared_entity_reference(self):
         self.assertRejected(b64('<r {}>&custom;</r>'.format(SAML_NS)), 'malformed XML')
 
