@@ -7,27 +7,25 @@ requests, or discussions. Do not attach real passwords, session tokens, OAuth
 codes, MFA codes, device tokens, SAML assertions, or AWS/Alibaba credentials to
 any report.
 
-This project does not yet have a dedicated, monitored security mailbox, and
-private vulnerability reporting may not be enabled for this repository. Use the
-first route below that is available to you:
+A monitored security mailbox and response commitments are not documented here.
+Private-reporting settings have not been verified.
 
-1. **GitHub private vulnerability reporting.** Open the repository's
-   [Security tab](https://github.com/Nike-Inc/gimme-aws-creds/security). If a
-   **Report a vulnerability** button is shown, use it. That form is visible only
-   to you and the repository maintainers. If the button is not shown, private
-   reporting is not enabled; go to step 2.
-2. **Ask for a private channel.** Email
-   [opensource@nike.com](mailto:opensource@nike.com), the general contact
-   listed in [CONTRIBUTING.md](CONTRIBUTING.md). It is not a dedicated security
-   inbox. In the first message, say only that you have a security report for
-   gimme-aws-creds and ask where to send it privately. Do not include
-   vulnerability details until a private channel is agreed.
-3. **No response.** If neither route works, you may open a public issue that
-   says only that you need a private security contact. Do not describe the
-   vulnerability, the affected code, or how to reproduce it in that issue.
+For defects in this fork, open
+[this fork's Security tab](https://github.com/1solomonwakhungu/gimme-aws-creds/security).
+If **Report a vulnerability** is available, use that private GitHub reporting
+route; access follows GitHub's advisory permissions. Otherwise, ask this fork's
+maintainer for a private contact in an issue containing no vulnerability details.
 
-There is no committed response time. Reports are handled on a best-effort basis
-by the project maintainers.
+For defects affecting upstream, check the
+[upstream Security tab](https://github.com/Nike-Inc/gimme-aws-creds/security)
+for its private reporting route. The upstream general contact,
+[opensource@nike.com](mailto:opensource@nike.com), is listed in the inherited
+[CONTRIBUTING.md](CONTRIBUTING.md); it is not identified there as a security
+inbox or a contact for this fork. If using that contact, ask only where to send
+an upstream security report privately. Do not include vulnerability details
+until a private channel is agreed.
+
+No response time or report-handling commitment is established by this document.
 
 ### What to include
 
@@ -53,18 +51,20 @@ provider or cloud administrator first.
 
 ## Supported versions
 
-| Version | Security fixes |
-|---|---|
-| Latest release published on [PyPI](https://pypi.org/project/gimme-aws-creds/) | Fixes are made on `master` and shipped in a later release |
-| `master` (unreleased) | Fixes land here first; it may contain changes not yet reviewed for release |
-| Older releases | Upgrade to the latest release |
+A security-support, release, and backport policy has not been established in
+the documentation reviewed for this change. The fork owner must define those
+commitments before any version is represented as receiving security updates.
+The Python installation constraint for this source is declared in
+[setup.py](setup.py); it is separate from a security-support commitment.
 
-The project maintains no long-term-support or backport branches. Python versions
-outside `python_requires` in [setup.py](setup.py) are not supported.
+A source fix may not yet be available in a published package. Check the release
+notes and dependency metadata for the version installed; upgrading to the
+latest published version does not by itself establish that a particular fix
+is included.
 
 The sample code in [`lambda/`](lambda/README.md) is unsupported reference code.
-It is not part of the published package, is not tested, and is not covered by
-this policy's fix process. See that directory's README for its known gaps.
+It is not installed as a Python package module and has no sample-specific tests
+in this repository. Its runtime and deployment gaps are listed in its README.
 
 ## Scope
 
@@ -78,15 +78,14 @@ misconfiguration of a specific organization's identity provider or IAM roles.
 If a dependency vulnerability is reachable through gimme-aws-creds, a report
 here is still welcome.
 
-## Maintainer setup still pending
+## Items for the owner to confirm
 
-This policy describes interim routes. The following owner actions have not been
-performed, and the reporting section above should be updated as each one is
-done:
+These operational controls have not been verified. The owner should confirm
+and document:
 
-- enable GitHub private vulnerability reporting for this repository;
-- designate and monitor a security contact or alias, and list it here;
-- decide whether to publish response targets for acknowledgement and fixes;
-- decide how advisories are published (for example, GitHub Security
-  Advisories and CVE requests) and how reporters are credited;
-- decide whether the `lambda/` sample is removed or brought under support.
+- whether private vulnerability reporting is enabled for this repository;
+- a monitored private security contact and its scope;
+- supported versions, backport policy, and release responsibility;
+- any response targets for acknowledgement and fixes;
+- how advisories and reporter credit are handled;
+- whether the `lambda/` sample will be removed or brought under support.
