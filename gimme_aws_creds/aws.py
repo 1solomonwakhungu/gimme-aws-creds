@@ -11,12 +11,85 @@ See the License for the specific language governing permissions and* limitations
 """
 import base64
 import json
+import re
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 
 import gimme_aws_creds.common as commondef
 from .common import parse_saml_role_attributes, create_http_session
 from . import errors
+
+
+AWS_SAML_ACS_PARTITIONS = (
+    ('signin.aws.amazon.com', 'aws', 'us-east-1'),
+    ('signin.amazonaws.cn', 'aws-cn', 'cn-north-1'),
+    ('signin.amazonaws-us-gov.com', 'aws-us-gov', 'us-gov-east-1'),
+)
+
+_AWS_REGION_RE = re.compile(r'^[a-z]{2}(?:-[a-z]+)+-[0-9]+$')
+
+
+def parse_aws_saml_acs_url(saml_acs_url):
+    """Validate an AWS SAML ACS URL and return ``(partition, region)``.
+
+    Requires an HTTPS URL pointing to a recognized AWS SAML sign-in host
+    (optionally prefixed with a single AWS region label) and the exact
+    ``/saml`` path. Raises ``GimmeAWSCredsError`` for untrusted or malformed
+    URLs.
+    """
+    if not isinstance(saml_acs_url, str) or not saml_acs_url:
+        raise errors.GimmeAWSCredsError(
+            "{!r} is not a valid AWS SAML ACS URL".format(saml_acs_url)
+        )
+
+    if (
+        any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in saml_acs_url)
+        or any(ch in saml_acs_url for ch in ('\\', '?', '#', ';'))
+    ):
+        raise errors.GimmeAWSCredsError(
+            "{} is not a valid AWS SAML ACS URL".format(saml_acs_url)
+        )
+
+    parsed = urlparse(saml_acs_url)
+    hostname = parsed.hostname
+
+    try:
+        port = parsed.port
+    except ValueError:
+        raise errors.GimmeAWSCredsError(
+            "{} is not a valid AWS SAML ACS URL".format(saml_acs_url)
+        )
+
+    if (
+        parsed.scheme != 'https'
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.netloc.lower() not in (hostname, '{}:443'.format(hostname))
+        or parsed.path != '/saml'
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise errors.GimmeAWSCredsError(
+            "{} is not a valid AWS SAML ACS URL".format(saml_acs_url)
+        )
+
+    for base_host, partition, default_region in AWS_SAML_ACS_PARTITIONS:
+        if hostname == base_host:
+            return partition, default_region
+        regional_suffix = '.' + base_host
+        if hostname.endswith(regional_suffix):
+            region = hostname[:-len(regional_suffix)]
+            if _AWS_REGION_RE.fullmatch(region):
+                return partition, region
+            break
+
+    raise errors.GimmeAWSCredsError(
+        "{} is not a valid AWS SAML ACS URL".format(saml_acs_url)
+    )
 
 
 class AwsResolver:
@@ -34,11 +107,13 @@ class AwsResolver:
 
     def get_signinpage(self, saml_token, saml_target_url):
         """ Post SAML token to aws sign in page and get back html result"""
+        parse_aws_saml_acs_url(saml_target_url)
+
         payload = {
             'SAMLResponse': saml_token,
             'RelayState': ''
         }
-        
+
         response = self._http_client.post(
             saml_target_url,
             data=payload,
