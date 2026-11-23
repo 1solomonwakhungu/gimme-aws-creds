@@ -43,8 +43,8 @@ MAX_MEMBERS = 2000
 # the project floor is 2.6.3. Releases must never allow an older urllib3.
 URLLIB3_FLOOR = Version("2.6.3")
 URLLIB3_FORBIDDEN_PROBES = ("1.26.20", "2.0.0", "2.5.0", "2.6.0", "2.6.2", "2.6.3rc1")
-SUPPORTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
-UNSUPPORTED_PYTHONS = ("3.9",)
+SUPPORTED_PYTHONS = ("3.11", "3.12", "3.13", "3.14")
+UNSUPPORTED_PYTHONS = ("3.9", "3.10")
 
 SUMS_LINE = re.compile(r"^([0-9a-f]{64})  ([A-Za-z0-9._+-]+)$")
 

@@ -42,9 +42,9 @@ class TestBuildVerification(unittest.TestCase):
         """Verify python_requires is set correctly"""
         with open(self.setup_py) as f:
             content = f.read()
-            # Python 3.10+ required for boto3>=1.42.24 with urllib3>=2.6.3
-            self.assertIn('python_requires=">=3.10"', content,
-                         "setup.py must specify python_requires >= 3.10")
+            # Python 3.11+ required for patched soupsieve releases (3.0.2+/4.x)
+            self.assertIn('python_requires=">=3.11"', content,
+                         "setup.py must specify python_requires >= 3.11")
 
     def test_setup_py_scripts_included(self):
         """Verify scripts are included in setup.py"""

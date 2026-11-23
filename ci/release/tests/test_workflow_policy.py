@@ -21,7 +21,7 @@ PINNED_ACTIONS = {
     "actions/download-artifact": ("9000827ccba6bdab643e8b6fd33ac0654aef8333", "v8.0.2"),
     "pypa/gh-action-pypi-publish": ("7245906fb61fa33a13554f9d5fb856fe61758086", "v1.14.3"),
 }
-SUPPORTED_PYTHONS = ["3.10", "3.11", "3.12", "3.13", "3.14"]
+SUPPORTED_PYTHONS = ["3.11", "3.12", "3.13", "3.14"]
 USES_LINE = re.compile(r"^\s*(?:-\s+)?uses:\s*(\S+)(.*)$")
 
 

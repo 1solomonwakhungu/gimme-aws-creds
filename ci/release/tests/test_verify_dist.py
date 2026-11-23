@@ -13,7 +13,7 @@ VERSION = "2.9.0"
 REQUIREMENTS = "requests>=2.31.0,<3.0.0\nurllib3>=2.6.3,<3.0.0\n"
 
 
-def metadata(version=VERSION, urllib3="urllib3<3.0.0,>=2.6.3", requires_python=">=3.10", name="gimme_aws_creds"):
+def metadata(version=VERSION, urllib3="urllib3<3.0.0,>=2.6.3", requires_python=">=3.11", name="gimme_aws_creds"):
     return (
         "Metadata-Version: 2.4\n"
         f"Name: {name}\n"
@@ -194,10 +194,10 @@ def test_sdist_requirements_must_match_reviewed_file(dist, requirements_file):
 
 
 def test_requires_python_must_match_supported_range(dist, requirements_file):
-    make_wheel(dist, meta=metadata(requires_python=">=3.9"))
-    make_sdist(dist, meta=metadata(requires_python=">=3.9"))
+    make_wheel(dist, meta=metadata(requires_python=">=3.10"))
+    make_sdist(dist, meta=metadata(requires_python=">=3.10"))
     _, failures = run(dist, requirements_file)
-    assert any("admits unsupported Python 3.9" in f for f in failures)
+    assert any("admits unsupported Python 3.10" in f for f in failures)
 
 
 @pytest.mark.parametrize("tag,expected", [
