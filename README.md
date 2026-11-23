@@ -87,7 +87,7 @@ See [Configuration](#configuration) and [Usage](#usage) for full details, or [Cl
 
 ## Prerequisites
 
-- **Python 3.10+**
+- **Python 3.11+**
 - **Okta SAML integration to AWS** using the [AWS App](https://help.okta.com/en-us/content/topics/deploymentguides/aws/aws-configure-identity-provider.htm).
 - **(Optional) [gimme-creds-lambda](https://github.com/Nike-Inc/gimme-aws-creds/tree/master/lambda)** as a proxy to the Okta APIs needed by gimme-aws-creds. This removes the requirement of an Okta API key. gimme-aws-creds authenticates to gimme-creds-lambda using OpenID Connect and the lambda handles all interactions with the Okta APIs. Alternately, set the `OKTA_API_KEY` environment variable and the `gimme_creds_server` configuration value to `internal` to call the Okta APIs directly.
 - **(Optional) Alibaba Cloud SDK extras** if you plan to retrieve Alibaba Cloud RAM credentials: `pip install "gimme-aws-creds[alicloud]"`. See [Alibaba Cloud](#alibaba-cloud).

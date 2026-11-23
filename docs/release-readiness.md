@@ -13,11 +13,11 @@ uploaded, until a maintainer completes every step in
 
 | Job | Runs on | Token permissions | Purpose |
 |---|---|---|---|
-| `test` | push, PR, release | `contents: read` | Unit tests on Python 3.10–3.14 from source |
+| `test` | push, PR, release | `contents: read` | Unit tests on Python 3.11–3.14 from source |
 | `code-scan` | push, PR, release | `actions: read`, `contents: read`, `security-events: write` | CodeQL |
 | `release-tooling` | push, PR, release | `contents: read` | Tests for the workflow policy and the scripts in `ci/release/` |
 | `build` | push, PR, release | `contents: read` | Builds the sdist and wheel **once** with hash-locked tools, checks them, writes `SHA256SUMS`, and uploads them as the `release-dist` artifact |
-| `verify-artifacts` | push, PR, release | `contents: read` | On each of Python 3.10–3.14: checks hashes, installs the built wheel into a clean environment, runs `pip check`, audits the resolved dependencies, runs the Content-Encoding bound check, and runs the unit tests against the installed wheel |
+| `verify-artifacts` | push, PR, release | `contents: read` | On each of Python 3.11–3.14: checks hashes, installs the built wheel into a clean environment, runs `pip check`, audits the resolved dependencies, runs the Content-Encoding bound check, and runs the unit tests against the installed wheel |
 | `release-gate` | release only | `actions: read`, `contents: read` | Fails closed unless publication is enabled and the protected environment is verified |
 | `publish` | release only, after the gate | `id-token: write` | Re-checks hashes and uploads exactly the verified files with Trusted Publishing |
 
@@ -37,15 +37,15 @@ Pull requests from forks run with a read-only token, and the `release-gate` and
    paths, no links or devices in the sdist, and no top-level packages other than
    `gimme_aws_creds`. It also checks that `LICENSE` and `NOTICE` ship in both
    archives, that wheel `RECORD` digests match, and that the wheel and sdist
-   agree on name and version. `Requires-Python` must admit 3.10–3.14 and reject
-   3.9. Runtime `Requires-Dist` must equal `requirements.txt`, and urllib3 must be
+   agree on name and version. `Requires-Python` must admit 3.11–3.14 and reject
+   3.9 and 3.10. Runtime `Requires-Dist` must equal `requirements.txt`, and urllib3 must be
    unconditional with a floor of **2.6.3 or newer**. For a release, the tag must
    equal `v<version>` and the version must not be a dev or local version. Only
    when every check passes does it write `dist/SHA256SUMS`.
 3. The SHA-256 of `SHA256SUMS` is passed from `build` as a job output. Each
    downstream job compares the downloaded `SHA256SUMS` with that digest, then
    checks each artifact against `SHA256SUMS`.
-4. `verify-artifacts` tests the downloaded wheel on Python 3.10–3.14:
+4. `verify-artifacts` tests the downloaded wheel on Python 3.11–3.14:
    * installs `gimme_aws_creds-*.whl[alicloud]` into a new virtual environment
      and runs `pip check`;
    * runs `pip-audit --strict` (hash-locked from
